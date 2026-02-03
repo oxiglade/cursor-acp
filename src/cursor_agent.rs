@@ -15,7 +15,7 @@ use agent_client_protocol::{
     Error, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
     ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelInfo, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionId, SessionMode, SessionModeState, SessionModelState, SessionNotification,
+    SessionId, SessionInfo, SessionMode, SessionModeState, SessionModelState, SessionNotification,
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
     SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
@@ -23,6 +23,7 @@ use tracing::{debug, info};
 
 use crate::cursor_process::find_cursor_binary;
 use crate::session::Session;
+use crate::session_storage::{generate_title, SessionMetadata, SessionStorage};
 use crate::ACP_CLIENT;
 
 /// Authentication method for Cursor
@@ -67,6 +68,8 @@ pub struct CursorAgent {
     next_session_id: RefCell<u64>,
     /// Whether authentication has been completed
     authenticated: RefCell<bool>,
+    /// Persistent session storage for history
+    session_storage: RefCell<SessionStorage>,
 }
 
 impl CursorAgent {
@@ -75,12 +78,20 @@ impl CursorAgent {
         // Check if already authenticated (has API key or cached credentials)
         let authenticated = std::env::var("CURSOR_API_KEY").is_ok();
 
+        // Load persistent session storage
+        let session_storage = SessionStorage::load();
+        info!(
+            "Loaded {} sessions from storage",
+            session_storage.list().len()
+        );
+
         Self {
             client_capabilities: Arc::default(),
             sessions: Rc::default(),
             session_roots: Arc::default(),
             next_session_id: RefCell::new(1),
             authenticated: RefCell::new(authenticated),
+            session_storage: RefCell::new(session_storage),
         }
     }
 
@@ -192,7 +203,7 @@ impl Agent for CursorAgent {
 
         let agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
-            .load_session(false); // We don't persist sessions yet
+            .load_session(true); // We now support session persistence
 
         let auth_methods = self.build_auth_methods();
 
@@ -275,13 +286,17 @@ impl Agent for CursorAgent {
 
         let session = Rc::new(Session::new(
             session_id.clone(),
-            cwd,
+            cwd.clone(),
             self.client_capabilities.clone(),
         ));
 
         self.sessions
             .borrow_mut()
             .insert(session_id.clone(), session);
+
+        // Persist session metadata
+        let metadata = SessionMetadata::new(session_id.clone(), cwd);
+        self.session_storage.borrow_mut().upsert(metadata);
 
         debug!("Created new session: {}", session_id.0);
 
@@ -319,27 +334,141 @@ impl Agent for CursorAgent {
         &self,
         request: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, Error> {
-        // We don't persist sessions yet
-        info!(
-            "Load session request: {} (not supported)",
-            request.session_id
+        let session_id_str = request.session_id.0.to_string();
+        info!("Load session request: {}", session_id_str);
+
+        // Check if session exists in storage
+        let metadata = {
+            let storage = self.session_storage.borrow();
+            storage.get(&session_id_str).cloned()
+        };
+
+        let Some(metadata) = metadata else {
+            info!("Session {} not found in storage", session_id_str);
+            return Err(Error::resource_not_found(None));
+        };
+
+        // Create a new session with the stored CWD
+        let session = Rc::new(Session::new(
+            request.session_id.clone(),
+            metadata.cwd.clone(),
+            self.client_capabilities.clone(),
+        ));
+
+        // Restore Cursor CLI session ID for conversation continuity
+        if let Some(cursor_sid) = &metadata.cursor_session_id {
+            session.set_cursor_session_id(cursor_sid.clone());
+            debug!("Restored Cursor session ID: {}", cursor_sid);
+        }
+
+        // Store the session
+        self.sessions
+            .borrow_mut()
+            .insert(request.session_id.clone(), session);
+
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(request.session_id.clone(), metadata.cwd.clone());
+
+        // Touch the session to update last access time
+        self.session_storage.borrow_mut().touch(&session_id_str);
+
+        debug!("Loaded session: {}", session_id_str);
+
+        self.send_available_commands(request.session_id.clone());
+
+        let modes = SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default")
+                    .description("Normal mode with full tool access"),
+                SessionMode::new("plan", "Plan").description("Read-only planning mode"),
+                SessionMode::new("ask", "Ask").description("Q&A mode for explanations"),
+            ],
         );
-        Err(Error::resource_not_found(None))
+
+        let models = SessionModelState::new(
+            "auto",
+            vec![
+                ModelInfo::new("auto", "Auto"),
+                ModelInfo::new("opus-4.5-thinking", "Claude 4.5 Opus (Thinking)"),
+                ModelInfo::new("opus-4.5", "Claude 4.5 Opus"),
+                ModelInfo::new("sonnet-4.5-thinking", "Claude 4.5 Sonnet (Thinking)"),
+                ModelInfo::new("sonnet-4.5", "Claude 4.5 Sonnet"),
+                ModelInfo::new("gpt-5.2", "GPT-5.2"),
+                ModelInfo::new("gemini-3-pro", "Gemini 3 Pro"),
+            ],
+        );
+
+        Ok(LoadSessionResponse::new().modes(modes).models(models))
     }
 
     async fn list_sessions(
         &self,
         _request: ListSessionsRequest,
     ) -> Result<ListSessionsResponse, Error> {
-        // Return empty list - we don't persist sessions
-        Ok(ListSessionsResponse::new(vec![]))
+        let storage = self.session_storage.borrow();
+        let sessions: Vec<SessionInfo> = storage
+            .list()
+            .into_iter()
+            .map(|meta| {
+                let mut info =
+                    SessionInfo::new(SessionId::new(meta.session_id.clone()), meta.cwd.clone());
+
+                if let Some(title) = &meta.title {
+                    info = info.title(title.clone());
+                }
+
+                // Set the updated_at timestamp
+                info = info.updated_at(meta.updated_at.to_rfc3339());
+
+                info
+            })
+            .collect();
+
+        info!("Listing {} sessions", sessions.len());
+        Ok(ListSessionsResponse::new(sessions))
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
-        info!("Processing prompt for session: {}", request.session_id);
+        let session_id_str = request.session_id.0.to_string();
+        info!("Processing prompt for session: {}", session_id_str);
+
+        // Extract prompt text for title generation
+        let prompt_text: String = request
+            .prompt
+            .iter()
+            .filter_map(|block| {
+                if let agent_client_protocol::ContentBlock::Text(t) = block {
+                    Some(t.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Generate title from first prompt and update session
+        if !prompt_text.is_empty() {
+            let title = generate_title(&prompt_text);
+            self.session_storage
+                .borrow_mut()
+                .set_title(&session_id_str, title);
+        }
+
+        // Touch the session to update last activity time
+        self.session_storage.borrow_mut().touch(&session_id_str);
 
         let session = self.get_session(&request.session_id)?;
         let stop_reason = session.prompt(request).await?;
+
+        // Save the Cursor CLI session ID for conversation continuity
+        if let Some(cursor_sid) = session.cursor_session_id() {
+            self.session_storage
+                .borrow_mut()
+                .set_cursor_session_id(&session_id_str, cursor_sid);
+        }
 
         Ok(PromptResponse::new(stop_reason))
     }

@@ -66,6 +66,7 @@ impl CursorProcess {
         working_dir: Option<&std::path::Path>,
         model: Option<&str>,
         mode: Option<&str>,
+        resume_session_id: Option<&str>,
     ) -> Result<Self> {
         let cursor_bin = find_cursor_binary()?;
 
@@ -74,12 +75,20 @@ impl CursorProcess {
         // Headless mode with stream-json output (flags first, then prompt)
         cmd.arg("-p").arg("--output-format").arg("stream-json");
 
+        // Skip permission prompts - the ACP client handles permissions
+        cmd.arg("--force");
+
         if let Some(model) = model {
             cmd.arg("--model").arg(model);
         }
 
         if let Some(mode) = mode {
             cmd.arg("--mode").arg(mode);
+        }
+
+        // Resume previous session for conversation continuity
+        if let Some(session_id) = resume_session_id {
+            cmd.arg("--resume").arg(session_id);
         }
 
         // Prompt comes last

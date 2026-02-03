@@ -29,6 +29,8 @@ pub struct Session {
     model: RefCell<Option<String>>,
     mode: RefCell<Option<String>>,
     active_process: TokioMutex<Option<CursorProcess>>,
+    /// Cursor CLI's internal session ID for conversation continuity
+    cursor_session_id: RefCell<Option<String>>,
 }
 
 impl Session {
@@ -44,6 +46,7 @@ impl Session {
             model: RefCell::new(None),
             mode: RefCell::new(None),
             active_process: TokioMutex::new(None),
+            cursor_session_id: RefCell::new(None),
         }
     }
 
@@ -53,6 +56,14 @@ impl Session {
 
     pub fn set_mode(&self, mode: String) {
         *self.mode.borrow_mut() = Some(mode);
+    }
+
+    pub fn set_cursor_session_id(&self, id: String) {
+        *self.cursor_session_id.borrow_mut() = Some(id);
+    }
+
+    pub fn cursor_session_id(&self) -> Option<String> {
+        self.cursor_session_id.borrow().clone()
     }
 
     /// Process a prompt request by spawning Cursor CLI
@@ -83,12 +94,14 @@ impl Session {
 
         let model = self.model.borrow().clone();
         let mode = self.mode.borrow().clone();
+        let resume_session_id = self.cursor_session_id.borrow().clone();
 
         let mut process = CursorProcess::spawn(
             &prompt_text,
             Some(self.cwd.as_path()),
             model.as_deref(),
             mode.as_deref(),
+            resume_session_id.as_deref(),
         )
         .await
         .map_err(|e| {
@@ -256,6 +269,12 @@ impl Session {
                     }
                 },
                 StreamEvent::Result(res) => {
+                    // Capture the Cursor CLI session ID for conversation continuity
+                    if let Some(cursor_sid) = &res.session_id {
+                        *self.cursor_session_id.borrow_mut() = Some(cursor_sid.clone());
+                        debug!("Captured Cursor session ID: {}", cursor_sid);
+                    }
+
                     if res.is_error {
                         if let Some(error) = &res.error {
                             // Check for authentication error

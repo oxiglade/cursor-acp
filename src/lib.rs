@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 mod cursor_agent;
 mod cursor_process;
 mod session;
+mod session_storage;
 mod stream_json;
 
 pub use cursor_agent::CursorAgent;

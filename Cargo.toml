@@ -30,6 +30,8 @@ anyhow = "1"
 async-trait = "0.1"
 which = "7"
 uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
