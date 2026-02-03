@@ -12,19 +12,17 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client, ClientCapabilities,
-    ContentChunk, Error, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelInfo,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, SessionId, SessionInfo, SessionMode, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse, ToolCall, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    Error, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelInfo, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
+    SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use tracing::{debug, info};
 
 use crate::cursor_process::find_cursor_binary;
-use crate::message_history::HistoryMessage;
 use crate::session::Session;
 use crate::session_storage::{generate_title, SessionMetadata, SessionStorage};
 use crate::ACP_CLIENT;
@@ -88,11 +86,29 @@ impl CursorAgent {
             session_storage.list().len()
         );
 
+        // Initialize next_session_id to avoid reusing existing session IDs
+        let max_existing_id = session_storage
+            .list()
+            .iter()
+            .filter_map(|meta| {
+                meta.session_id
+                    .strip_prefix("cursor-session-")
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+
+        debug!(
+            "Next session ID will be {} (max existing: {})",
+            max_existing_id + 1,
+            max_existing_id
+        );
+
         Self {
             client_capabilities: Arc::default(),
             sessions: Rc::default(),
             session_roots: Arc::default(),
-            next_session_id: RefCell::new(1),
+            next_session_id: RefCell::new(max_existing_id + 1),
             authenticated: RefCell::new(authenticated),
             session_storage: RefCell::new(session_storage),
         }
@@ -175,103 +191,6 @@ impl CursorAgent {
             }
         });
     }
-
-    /// Stream message history to the client for a loaded session
-    async fn stream_history(&self, session_id: &SessionId, session: &Session) {
-        let history = session.load_message_history();
-
-        if history.is_empty() {
-            debug!("No message history to stream for session {}", session_id.0);
-            return;
-        }
-
-        info!(
-            "Streaming {} messages from history for session {}",
-            history.len(),
-            session_id.0
-        );
-
-        let Some(client) = ACP_CLIENT.get() else {
-            return;
-        };
-
-        for message in history.messages {
-            let update = match message {
-                HistoryMessage::User { content, .. } => {
-                    SessionUpdate::UserMessageChunk(ContentChunk::new(content.into()))
-                }
-                HistoryMessage::Agent { content, .. } => {
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(content.into()))
-                }
-                HistoryMessage::Thought { content, .. } => {
-                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(content.into()))
-                }
-                HistoryMessage::ToolCall {
-                    call_id,
-                    title,
-                    kind,
-                    input,
-                    output,
-                    status,
-                    ..
-                } => {
-                    // First send the tool call
-                    let tool_kind = match kind.as_str() {
-                        "Read" => ToolKind::Read,
-                        "Edit" => ToolKind::Edit,
-                        "Delete" => ToolKind::Delete,
-                        "Execute" => ToolKind::Execute,
-                        "Search" => ToolKind::Search,
-                        "Fetch" => ToolKind::Fetch,
-                        "Think" => ToolKind::Think,
-                        _ => ToolKind::Other,
-                    };
-
-                    let mut tool_call = ToolCall::new(ToolCallId::new(call_id.clone()), title)
-                        .kind(tool_kind)
-                        .status(ToolCallStatus::Completed);
-
-                    if let Some(inp) = input {
-                        tool_call = tool_call.raw_input(inp);
-                    }
-                    if let Some(out) = &output {
-                        tool_call = tool_call.raw_output(out.clone());
-                    }
-
-                    // Send the tool call
-                    let notification = SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::ToolCall(tool_call),
-                    );
-                    if let Err(e) = client.session_notification(notification).await {
-                        tracing::error!("Failed to stream tool call: {:?}", e);
-                    }
-
-                    // Send completion update if completed
-                    if status == "completed" {
-                        let mut fields =
-                            ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
-                        if let Some(out) = output {
-                            fields = fields.raw_output(out);
-                        }
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            ToolCallId::new(call_id),
-                            fields,
-                        ))
-                    } else {
-                        continue; // Skip sending update for incomplete tools
-                    }
-                }
-            };
-
-            let notification = SessionNotification::new(session_id.clone(), update);
-            if let Err(e) = client.session_notification(notification).await {
-                tracing::error!("Failed to stream history message: {:?}", e);
-            }
-        }
-
-        debug!("Finished streaming history for session {}", session_id.0);
-    }
 }
 
 impl Default for CursorAgent {
@@ -301,9 +220,17 @@ impl Agent for CursorAgent {
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
-        let agent_capabilities = AgentCapabilities::new()
+        let session_capabilities = SessionCapabilities::new().list(SessionListCapabilities::new());
+
+        let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
             .load_session(true);
+        agent_capabilities.session_capabilities = session_capabilities;
+
+        debug!(
+            "Agent capabilities being sent: {:?}",
+            serde_json::to_string(&agent_capabilities)
+        );
 
         let auth_methods = self.build_auth_methods();
 
@@ -497,9 +424,6 @@ impl Agent for CursorAgent {
             }
         }
 
-        // Stream conversation history to the client before storing
-        self.stream_history(&request.session_id, &session).await;
-
         // Store the session
         self.sessions
             .borrow_mut()
@@ -585,7 +509,15 @@ impl Agent for CursorAgent {
             })
             .collect();
 
-        info!("Listing {} sessions", sessions.len());
+        info!("Listing {} sessions:", sessions.len());
+        for session in &sessions {
+            debug!(
+                "  - {} (title: {:?}, cwd: {})",
+                session.session_id.0,
+                session.title,
+                session.cwd.display()
+            );
+        }
         Ok(ListSessionsResponse::new(sessions))
     }
 
@@ -695,5 +627,51 @@ impl Agent for CursorAgent {
         );
         // Not implemented yet
         Ok(SetSessionConfigOptionResponse::new(vec![]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_capabilities_serialization() {
+        let session_capabilities = SessionCapabilities::new().list(SessionListCapabilities::new());
+        let mut agent_capabilities = AgentCapabilities::new()
+            .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
+            .load_session(true);
+        agent_capabilities.session_capabilities = session_capabilities.clone();
+
+        let json = serde_json::to_string_pretty(&agent_capabilities).unwrap();
+        println!("Agent capabilities JSON:\n{}", json);
+
+        // Verify that session_capabilities.list is present
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value["sessionCapabilities"]["list"].is_object(),
+            "sessionCapabilities.list should be present as an object"
+        );
+
+        // Test the full InitializeResponse
+        let auth_methods = vec![AuthMethod::new(
+            CursorAuthMethod::BrowserLogin,
+            "Login with Cursor",
+        )];
+
+        let response = InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(agent_capabilities)
+            .agent_info(
+                Implementation::new("cursor-acp", env!("CARGO_PKG_VERSION")).title("Cursor"),
+            )
+            .auth_methods(auth_methods);
+
+        let response_json = serde_json::to_string_pretty(&response).unwrap();
+        println!("\nFull InitializeResponse JSON:\n{}", response_json);
+
+        let response_value: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+        assert!(
+            response_value["agentCapabilities"]["sessionCapabilities"]["list"].is_object(),
+            "Full response should have agentCapabilities.sessionCapabilities.list"
+        );
     }
 }
