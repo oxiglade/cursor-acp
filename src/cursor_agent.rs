@@ -203,7 +203,7 @@ impl Agent for CursorAgent {
 
         let agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
-            .load_session(true); // We now support session persistence
+            .load_session(true);
 
         let auth_methods = self.build_auth_methods();
 

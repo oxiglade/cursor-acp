@@ -1,108 +1,54 @@
-# cursor-acp
+# ACP adapter for Cursor
 
-An [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) adapter for [Cursor CLI](https://cursor.com/cli), enabling Cursor to work with ACP-compatible development environments like [Zed](https://zed.dev/).
+Use [Cursor](https://cursor.com/) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
 
-## Overview
+This tool implements an ACP adapter around the Cursor CLI, supporting:
 
-cursor-acp bridges the Cursor CLI with the Agent Client Protocol, allowing you to use Cursor's AI coding capabilities within Zed and other ACP-compatible editors.
+- Context @-mentions
+- Images
+- Tool calls (with permission requests)
+- Extended thinking
+- Session history persistence
+- Model selection (Claude, GPT, Gemini)
+- Mode selection (default, plan, ask)
+- Auth Methods:
+  - Browser login (via `cursor-agent login`)
+  - CURSOR_API_KEY
 
-## Features
+Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
-- Browser-based login flow (via `cursor-agent login`)
-- Prompt processing via Cursor CLI
-- Streaming responses with real-time updates
-- Tool call notifications (file read/write, command execution)
-- Session management
-- Model selection
+## How to use
 
-## Installation
+### Zed
 
-### From Source
+Once registered in the ACP registry, Zed will be able to use this adapter out of the box.
+
+To use Cursor, open the Agent Panel and click "New Cursor Thread" from the `+` button menu in the top-right.
+
+Read the docs on [External Agent](https://zed.dev/docs/ai/external-agents) support.
+
+### Other clients
+
+Or try it with any of the other [ACP compatible clients](https://agentclientprotocol.com/overview/clients)!
+
+#### Prerequisites
+
+[Cursor CLI](https://cursor.com/cli) must be installed:
 
 ```bash
-git clone https://github.com/oxideai/cursor-acp
-cd cursor-acp
-cargo install --path .
+curl https://cursor.com/install -fsSL | bash
 ```
 
-### Prerequisites
+#### Installation
 
-- [Rust](https://rustup.rs/) toolchain
-- [Cursor CLI](https://cursor.com/cli) installed and in your PATH
-  ```bash
-  curl https://cursor.com/install -fsSL | bash
-  ```
+Install the adapter from the latest release for your architecture and OS: https://github.com/oxideai/cursor-acp/releases
 
-## Authentication
+You can then use `cursor-acp` as a regular ACP agent:
 
-cursor-acp supports two authentication methods:
-
-### 1. Browser Login (Recommended)
-
-When you first use cursor-acp, it will prompt you to authenticate via browser. If the client (like Zed) supports it, it will automatically launch the login flow. Otherwise, you can run:
-
-```bash
-cursor-agent login
 ```
-
-This opens a browser to authenticate with your Cursor account.
-
-### 2. API Key
-
-Alternatively, set the `CURSOR_API_KEY` environment variable:
-
-```bash
-export CURSOR_API_KEY=your_api_key_here
-```
-
-## Usage
-
-### Running
-
-```bash
 cursor-acp
-```
-
-The adapter communicates over stdio using the ACP JSON-RPC protocol.
-
-### With Zed
-
-Configure Zed to use cursor-acp as an AI agent (documentation coming soon).
-
-## Architecture
-
-```
-┌─────────┐     ACP (JSON-RPC/stdio)     ┌─────────────┐     spawn + stream-json     ┌─────────────┐
-│   Zed   │ ◄──────────────────────────► │  cursor-acp │ ◄─────────────────────────► │ Cursor CLI  │
-└─────────┘                              └─────────────┘                              └─────────────┘
-```
-
-cursor-acp:
-1. Receives ACP protocol messages from the editor (Zed)
-2. Translates prompts to Cursor CLI commands
-3. Spawns Cursor CLI in headless mode with `--output-format stream-json`
-4. Parses streaming JSON events from Cursor
-5. Sends ACP session updates back to the editor
-
-## Development
-
-```bash
-# Build
-cargo build
-
-# Run tests
-cargo test
-
-# Run with debug logging
-RUST_LOG=debug cargo run
 ```
 
 ## License
 
 Apache-2.0
-
-## Related Projects
-
-- [codex-acp](https://github.com/zed-industries/codex-acp) - ACP adapter for OpenAI Codex
-- [claude-code-acp](https://github.com/zed-industries/claude-code-acp) - ACP adapter for Claude Code
-- [Agent Client Protocol](https://agentclientprotocol.com/) - The protocol specification
