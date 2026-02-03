@@ -20,29 +20,24 @@ use agent_client_protocol::{
 };
 use tracing::{debug, info};
 
+use crate::cursor_process::find_cursor_binary;
 use crate::session::Session;
 
 /// Authentication method for Cursor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorAuthMethod {
+    /// Browser login via `cursor-agent login`
+    BrowserLogin,
     /// Use CURSOR_API_KEY environment variable
-    CursorApiKey,
+    ApiKey,
 }
 
 impl From<CursorAuthMethod> for AuthMethodId {
     fn from(method: CursorAuthMethod) -> Self {
         Self::new(match method {
-            CursorAuthMethod::CursorApiKey => "cursor-api-key",
+            CursorAuthMethod::BrowserLogin => "cursor-login",
+            CursorAuthMethod::ApiKey => "cursor-api-key",
         })
-    }
-}
-
-impl From<CursorAuthMethod> for AuthMethod {
-    fn from(method: CursorAuthMethod) -> Self {
-        match method {
-            CursorAuthMethod::CursorApiKey => Self::new(method, "Use CURSOR_API_KEY")
-                .description("Requires setting the `CURSOR_API_KEY` environment variable."),
-        }
     }
 }
 
@@ -51,7 +46,8 @@ impl TryFrom<AuthMethodId> for CursorAuthMethod {
 
     fn try_from(value: AuthMethodId) -> Result<Self, Self::Error> {
         match value.0.as_ref() {
-            "cursor-api-key" => Ok(CursorAuthMethod::CursorApiKey),
+            "cursor-login" => Ok(CursorAuthMethod::BrowserLogin),
+            "cursor-api-key" => Ok(CursorAuthMethod::ApiKey),
             _ => Err(Error::invalid_params().data("unsupported authentication method")),
         }
     }
@@ -67,16 +63,22 @@ pub struct CursorAgent {
     session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
     /// Counter for generating session IDs
     next_session_id: RefCell<u64>,
+    /// Whether authentication has been completed
+    authenticated: RefCell<bool>,
 }
 
 impl CursorAgent {
     /// Create a new Cursor agent
     pub fn new() -> Self {
+        // Check if already authenticated (has API key or cached credentials)
+        let authenticated = std::env::var("CURSOR_API_KEY").is_ok();
+
         Self {
             client_capabilities: Arc::default(),
             sessions: Rc::default(),
             session_roots: Arc::default(),
             next_session_id: RefCell::new(1),
+            authenticated: RefCell::new(authenticated),
         }
     }
 
@@ -94,12 +96,50 @@ impl CursorAgent {
         SessionId::new(format!("cursor-session-{id}"))
     }
 
-    fn check_auth(&self) -> Result<(), Error> {
-        // Check if CURSOR_API_KEY is set
-        if std::env::var("CURSOR_API_KEY").is_err() {
-            return Err(Error::auth_required());
+    /// Build auth methods based on client capabilities
+    fn build_auth_methods(&self) -> Vec<AuthMethod> {
+        let caps = self.client_capabilities.lock().unwrap();
+
+        // Check if client supports terminal-auth capability
+        let supports_terminal_auth = caps
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("terminal-auth"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mut methods = Vec::new();
+
+        // Primary: Browser login (if terminal-auth is supported or as default)
+        let mut login_method =
+            AuthMethod::new(CursorAuthMethod::BrowserLogin, "Login with Cursor").description(
+                "Opens a browser to authenticate with your Cursor account",
+            );
+
+        // If client supports terminal-auth, add metadata for launching the login command
+        if supports_terminal_auth {
+            if let Ok(cli_path) = find_cursor_binary() {
+                let mut meta = serde_json::Map::new();
+                meta.insert(
+                    "terminal-auth".to_string(),
+                    serde_json::json!({
+                        "command": cli_path.to_string_lossy(),
+                        "args": ["login"]
+                    }),
+                );
+                login_method = login_method.meta(meta);
+            }
         }
-        Ok(())
+
+        methods.push(login_method);
+
+        // Secondary: API key
+        methods.push(
+            AuthMethod::new(CursorAuthMethod::ApiKey, "Use API Key")
+                .description("Set the CURSOR_API_KEY environment variable"),
+        );
+
+        methods
     }
 }
 
@@ -134,7 +174,7 @@ impl Agent for CursorAgent {
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
             .load_session(false); // We don't persist sessions yet
 
-        let auth_methods = vec![CursorAuthMethod::CursorApiKey.into()];
+        let auth_methods = self.build_auth_methods();
 
         Ok(InitializeResponse::new(ProtocolVersion::V1)
             .agent_capabilities(agent_capabilities)
@@ -151,21 +191,29 @@ impl Agent for CursorAgent {
         let auth_method = CursorAuthMethod::try_from(request.method_id)?;
 
         match auth_method {
-            CursorAuthMethod::CursorApiKey => {
+            CursorAuthMethod::BrowserLogin => {
+                // The client should have launched `cursor-agent login` via terminal-auth
+                // or the user ran it manually. We assume auth is complete after this.
+                info!("Browser login flow completed");
+                *self.authenticated.borrow_mut() = true;
+            }
+            CursorAuthMethod::ApiKey => {
                 if std::env::var("CURSOR_API_KEY").is_err() {
                     return Err(
                         Error::internal_error().data("CURSOR_API_KEY environment variable not set")
                     );
                 }
+                info!("API key authentication successful");
+                *self.authenticated.borrow_mut() = true;
             }
         }
 
-        info!("Authentication successful via {:?}", auth_method);
         Ok(AuthenticateResponse::new())
     }
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        self.check_auth()?;
+        // Don't require auth upfront - Cursor CLI will prompt if needed
+        // and we'll get an error we can surface
 
         let NewSessionRequest { cwd, .. } = request;
         info!("Creating new session with cwd: {}", cwd.display());
@@ -215,7 +263,6 @@ impl Agent for CursorAgent {
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
-        self.check_auth()?;
 
         let session = self.get_session(&request.session_id)?;
         let stop_reason = session.prompt(request).await?;

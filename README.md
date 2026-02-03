@@ -8,6 +8,7 @@ cursor-acp bridges the Cursor CLI with the Agent Client Protocol, allowing you t
 
 ## Features
 
+- Browser-based login flow (via `cursor-agent login`)
 - Prompt processing via Cursor CLI
 - Streaming responses with real-time updates
 - Tool call notifications (file read/write, command execution)
@@ -19,7 +20,7 @@ cursor-acp bridges the Cursor CLI with the Agent Client Protocol, allowing you t
 ### From Source
 
 ```bash
-git clone https://github.com/zed-industries/cursor-acp
+git clone https://github.com/oxideai/cursor-acp
 cd cursor-acp
 cargo install --path .
 ```
@@ -32,15 +33,29 @@ cargo install --path .
   curl https://cursor.com/install -fsSL | bash
   ```
 
-## Usage
+## Authentication
 
-### Environment Variables
+cursor-acp supports two authentication methods:
 
-Set your Cursor API key:
+### 1. Browser Login (Recommended)
+
+When you first use cursor-acp, it will prompt you to authenticate via browser. If the client (like Zed) supports it, it will automatically launch the login flow. Otherwise, you can run:
+
+```bash
+cursor-agent login
+```
+
+This opens a browser to authenticate with your Cursor account.
+
+### 2. API Key
+
+Alternatively, set the `CURSOR_API_KEY` environment variable:
 
 ```bash
 export CURSOR_API_KEY=your_api_key_here
 ```
+
+## Usage
 
 ### Running
 
