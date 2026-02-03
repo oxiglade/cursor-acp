@@ -96,6 +96,12 @@ impl Session {
         let mode = self.mode.borrow().clone();
         let resume_session_id = self.cursor_session_id.borrow().clone();
 
+        if let Some(ref sid) = resume_session_id {
+            info!("Resuming Cursor conversation (session_id={})", sid);
+        } else {
+            info!("Starting new Cursor conversation (no previous session_id)");
+        }
+
         let mut process = CursorProcess::spawn(
             &prompt_text,
             Some(self.cwd.as_path()),
@@ -196,14 +202,38 @@ impl Session {
         }
     }
 
+    /// Capture Cursor CLI session ID from any event that carries it
+    fn capture_cursor_session_id_if_present(&self, new_session_id: Option<&String>) {
+        if let Some(new_id) = new_session_id {
+            let current_id = self.cursor_session_id.borrow().clone();
+
+            match &current_id {
+                Some(old_id) if old_id != new_id => {
+                    error!(
+                        "Cursor session ID changed unexpectedly: {} -> {}",
+                        old_id, new_id
+                    );
+                }
+                None => {
+                    debug!("Captured Cursor session ID: {}", new_id);
+                }
+                _ => {}
+            }
+
+            *self.cursor_session_id.borrow_mut() = Some(new_id.clone());
+        }
+    }
+
     /// Process events from Cursor CLI and send ACP updates
     async fn process_events(&self, process: &mut CursorProcess) -> Result<StopReason, Error> {
         while let Some(event) = process.next_event().await {
             match event {
                 StreamEvent::System(sys) => {
                     debug!("Cursor system event: subtype={}", sys.subtype);
+                    self.capture_cursor_session_id_if_present(sys.session_id.as_ref());
                 }
                 StreamEvent::Thinking(thinking) => {
+                    self.capture_cursor_session_id_if_present(thinking.session_id.as_ref());
                     // Send thinking chunks as agent thought
                     if let Some(text) = &thinking.text {
                         self.send_agent_thought(text).await;
@@ -228,52 +258,53 @@ impl Session {
                         }
                     }
                 }
-                StreamEvent::ToolCall(tc) => match tc.subtype {
-                    ToolCallSubtype::Started => {
-                        let tool_name = tc.tool_name.as_deref().unwrap_or("unknown");
-                        debug!("Tool call started: {} - {}", tc.call_id, tool_name);
+                StreamEvent::ToolCall(tc) => {
+                    self.capture_cursor_session_id_if_present(tc.session_id.as_ref());
+                    let tool_name = tc.get_tool_name().unwrap_or("unknown");
+                    let arguments = tc.get_arguments().cloned();
 
-                        let mut tool_call = ToolCall::new(
-                            ToolCallId::new(tc.call_id.clone()),
-                            format_tool_title(tool_name, &tc.arguments),
-                        )
-                        .kind(map_tool_kind(tool_name))
-                        .status(ToolCallStatus::InProgress);
+                    match tc.subtype {
+                        ToolCallSubtype::Started => {
+                            debug!("Tool call started: {} - {}", tc.call_id, tool_name);
 
-                        if let Some(args) = &tc.arguments {
-                            tool_call = tool_call.raw_input(args.clone());
-                        }
-                        self.send_tool_call(tool_call).await;
-                    }
-                    ToolCallSubtype::Completed => {
-                        debug!("Tool call completed: {}", tc.call_id);
+                            let mut tool_call = ToolCall::new(
+                                ToolCallId::new(tc.call_id.clone()),
+                                format_tool_title(tool_name, &arguments),
+                            )
+                            .kind(map_tool_kind(tool_name))
+                            .status(ToolCallStatus::InProgress);
 
-                        let mut fields =
-                            ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
-
-                        if let Some(result) = &tc.result {
-                            if let Some(output) = &result.output {
-                                fields =
-                                    fields.raw_output(serde_json::Value::String(output.clone()));
+                            if let Some(args) = &arguments {
+                                tool_call = tool_call.raw_input(args.clone());
                             }
-                            if let Some(error) = &result.error {
-                                fields = fields.raw_output(serde_json::json!({"error": error}));
-                            }
+                            self.send_tool_call(tool_call).await;
                         }
+                        ToolCallSubtype::Completed => {
+                            debug!("Tool call completed: {}", tc.call_id);
 
-                        self.send_tool_call_update(ToolCallUpdate::new(
-                            ToolCallId::new(tc.call_id.clone()),
-                            fields,
-                        ))
-                        .await;
+                            let mut fields =
+                                ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+
+                            if let Some(result) = &tc.result {
+                                if let Some(output) = &result.output {
+                                    fields = fields
+                                        .raw_output(serde_json::Value::String(output.clone()));
+                                }
+                                if let Some(error) = &result.error {
+                                    fields = fields.raw_output(serde_json::json!({"error": error}));
+                                }
+                            }
+
+                            self.send_tool_call_update(ToolCallUpdate::new(
+                                ToolCallId::new(tc.call_id.clone()),
+                                fields,
+                            ))
+                            .await;
+                        }
                     }
-                },
+                }
                 StreamEvent::Result(res) => {
-                    // Capture the Cursor CLI session ID for conversation continuity
-                    if let Some(cursor_sid) = &res.session_id {
-                        *self.cursor_session_id.borrow_mut() = Some(cursor_sid.clone());
-                        debug!("Captured Cursor session ID: {}", cursor_sid);
-                    }
+                    self.capture_cursor_session_id_if_present(res.session_id.as_ref());
 
                     if res.is_error {
                         if let Some(error) = &res.error {

@@ -89,6 +89,9 @@ impl CursorProcess {
         // Resume previous session for conversation continuity
         if let Some(session_id) = resume_session_id {
             cmd.arg("--resume").arg(session_id);
+            tracing::info!("Resuming Cursor session: {}", session_id);
+        } else {
+            tracing::info!("Starting fresh Cursor session (no resume ID)");
         }
 
         // Prompt comes last

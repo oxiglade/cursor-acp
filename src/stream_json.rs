@@ -25,7 +25,6 @@ pub enum StreamEvent {
 
 /// System initialization event
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SystemEvent {
     pub subtype: String,
     #[serde(default)]
@@ -36,6 +35,8 @@ pub struct SystemEvent {
     pub model: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Message event (user or assistant)
@@ -46,7 +47,6 @@ pub struct MessageEvent {
 
 /// Thinking event (for models with extended thinking)
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ThinkingEvent {
     pub subtype: String,
     #[serde(default)]
@@ -74,7 +74,6 @@ pub enum ContentPart {
 
 /// Tool call event
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ToolCallEvent {
     pub subtype: ToolCallSubtype,
     pub call_id: String,
@@ -84,6 +83,63 @@ pub struct ToolCallEvent {
     pub arguments: Option<serde_json::Value>,
     #[serde(default)]
     pub result: Option<ToolCallResult>,
+    #[serde(default)]
+    pub tool_call: Option<serde_json::Value>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+impl ToolCallEvent {
+    /// Get the tool name, checking both `tool_name` field and `tool_call` object keys
+    pub fn get_tool_name(&self) -> Option<&str> {
+        if let Some(name) = &self.tool_name {
+            return Some(name.as_str());
+        }
+
+        if let Some(tool_call) = &self.tool_call {
+            if let Some(obj) = tool_call.as_object() {
+                if let Some(key) = obj.keys().next() {
+                    return Some(Self::normalize_tool_name(key));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get arguments from either `arguments` field or nested in `tool_call`
+    pub fn get_arguments(&self) -> Option<&serde_json::Value> {
+        if self.arguments.is_some() {
+            return self.arguments.as_ref();
+        }
+
+        if let Some(tool_call) = &self.tool_call {
+            if let Some(obj) = tool_call.as_object() {
+                if let Some(inner) = obj.values().next() {
+                    if let Some(args) = inner.get("args") {
+                        return Some(args);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn normalize_tool_name(key: &str) -> &'static str {
+        match key {
+            "readToolCall" => "readFile",
+            "writeToolCall" => "writeFile",
+            "editToolCall" => "edit",
+            "lsToolCall" => "ls",
+            "searchToolCall" => "search",
+            "grepToolCall" => "grep",
+            "globToolCall" => "glob",
+            "bashToolCall" => "bash",
+            "fetchToolCall" => "fetch",
+            _ => "unknown",
+        }
+    }
 }
 
 /// Tool call subtype
@@ -96,7 +152,6 @@ pub enum ToolCallSubtype {
 
 /// Result of a tool call
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     #[serde(default)]
     pub success: bool,
@@ -104,7 +159,6 @@ pub struct ToolCallResult {
     pub output: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
-    /// For file operations
     #[serde(default)]
     pub lines_read: Option<u64>,
     #[serde(default)]
@@ -115,7 +169,6 @@ pub struct ToolCallResult {
 
 /// Final result event
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ResultEvent {
     pub subtype: String,
     #[serde(default)]
@@ -160,13 +213,14 @@ mod tests {
 
     #[test]
     fn test_parse_tool_call_started() {
-        let json = r#"{"type":"tool_call","subtype":"started","callId":"abc123","toolName":"readFile","arguments":{"path":"test.rs"}}"#;
+        let json = r#"{"type":"tool_call","subtype":"started","call_id":"abc123","tool_call":{"readToolCall":{"args":{"path":"test.rs"}}},"session_id":"test-session"}"#;
         let event = StreamEvent::parse(json).unwrap();
         match event {
             StreamEvent::ToolCall(tc) => {
                 assert_eq!(tc.subtype, ToolCallSubtype::Started);
                 assert_eq!(tc.call_id, "abc123");
-                assert_eq!(tc.tool_name, Some("readFile".to_string()));
+                assert_eq!(tc.get_tool_name(), Some("readFile"));
+                assert_eq!(tc.session_id, Some("test-session".to_string()));
             }
             _ => panic!("expected tool call event"),
         }

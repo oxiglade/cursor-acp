@@ -461,16 +461,16 @@ impl Agent for CursorAgent {
         self.session_storage.borrow_mut().touch(&session_id_str);
 
         let session = self.get_session(&request.session_id)?;
-        let stop_reason = session.prompt(request).await?;
+        let result = session.prompt(request).await;
 
-        // Save the Cursor CLI session ID for conversation continuity
+        // Save the Cursor CLI session ID (even on error)
         if let Some(cursor_sid) = session.cursor_session_id() {
             self.session_storage
                 .borrow_mut()
                 .set_cursor_session_id(&session_id_str, cursor_sid);
         }
 
-        Ok(PromptResponse::new(stop_reason))
+        Ok(PromptResponse::new(result?))
     }
 
     async fn cancel(&self, notification: CancelNotification) -> Result<(), Error> {
