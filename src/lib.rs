@@ -35,16 +35,13 @@ pub async fn run_main() -> IoResult<()> {
 
     tracing::info!("Starting cursor-acp adapter v{}", env!("CARGO_PKG_VERSION"));
 
-    // Create our Agent implementation
     let agent = Rc::new(CursorAgent::new());
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
 
-    // Run the I/O task to handle the actual communication
     LocalSet::new()
         .run_until(async move {
-            // Create the ACP connection
             let (client, io_task) = AgentSideConnection::new(agent.clone(), stdout, stdin, |fut| {
                 tokio::task::spawn_local(fut);
             });

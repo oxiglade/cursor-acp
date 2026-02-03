@@ -15,6 +15,8 @@ pub enum StreamEvent {
     User(MessageEvent),
     /// Assistant message event
     Assistant(MessageEvent),
+    /// Thinking event (for models with extended thinking)
+    Thinking(ThinkingEvent),
     /// Tool call event
     ToolCall(ToolCallEvent),
     /// Final result event
@@ -40,6 +42,19 @@ pub struct SystemEvent {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageEvent {
     pub message: Message,
+}
+
+/// Thinking event (for models with extended thinking)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingEvent {
+    pub subtype: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub timestamp_ms: Option<u64>,
 }
 
 /// A chat message

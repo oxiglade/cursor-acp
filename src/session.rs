@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::cursor_process::find_cursor_binary;
 use agent_client_protocol::{
     Client, ClientCapabilities, ContentBlock, ContentChunk, Error, PromptRequest, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
@@ -65,11 +66,18 @@ impl Session {
             return Ok(StopReason::EndTurn);
         }
 
+        info!("Received prompt text: {:?}", prompt_text);
+
+        // Handle /login command (with or without leading slash)
+        let trimmed = prompt_text.trim();
+        if trimmed == "/login" || trimmed == "login" {
+            return self.handle_login_command().await;
+        }
+
         info!("Processing prompt: {}", truncate(&prompt_text, 100));
 
         let model = self.model.borrow().clone();
 
-        // Spawn Cursor CLI process
         let mut process =
             CursorProcess::spawn(&prompt_text, Some(self.cwd.as_path()), model.as_deref())
                 .await
@@ -79,16 +87,83 @@ impl Session {
                     Error::internal_error().data(e.to_string())
                 })?;
 
-        // Process events from Cursor
-        let stop_reason = self.process_events(&mut process).await;
-
-        // Wait for process to complete
+        let result = self.process_events(&mut process).await;
         drop(process.wait().await);
 
         // Clear active process
         *self.active_process.lock().await = None;
 
-        Ok(stop_reason)
+        result
+    }
+
+    /// Handle the /login command by launching the cursor-agent login flow
+    async fn handle_login_command(&self) -> Result<StopReason, Error> {
+        info!("Handling /login command");
+
+        match find_cursor_binary() {
+            Ok(binary_path) => {
+                info!("Found cursor binary at: {:?}", binary_path);
+                self.send_agent_text("Launching Cursor login flow...\n")
+                    .await;
+
+                // Launch the login command with output capture for debugging
+                let result = tokio::process::Command::new(&binary_path)
+                    .arg("login")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+
+                match result {
+                    Ok(mut child) => {
+                        info!("Login process spawned successfully");
+                        self.send_agent_text(
+                            "Browser should open for authentication. Please complete login there.\n",
+                        )
+                        .await;
+
+                        match child.wait().await {
+                            Ok(status) => {
+                                info!("Login process exited with status: {}", status);
+                                if status.success() {
+                                    self.send_agent_text(
+                                        "Login completed! You can now use Cursor.\n",
+                                    )
+                                    .await;
+                                } else {
+                                    self.send_agent_text(&format!(
+                                        "Login process exited with status: {}\n",
+                                        status
+                                    ))
+                                    .await;
+                                }
+                                Ok(StopReason::EndTurn)
+                            }
+                            Err(e) => {
+                                error!("Failed to wait for login process: {e}");
+                                self.send_agent_text(&format!("Error waiting for login: {e}\n"))
+                                    .await;
+                                Ok(StopReason::EndTurn)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to spawn login process: {e}");
+                        self.send_agent_text(&format!("Failed to launch login: {e}\n"))
+                            .await;
+                        Err(Error::internal_error().data(e.to_string()))
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Cursor CLI not found: {e}");
+                self.send_agent_text(
+                    "Cursor CLI not found. Please install it:\n\
+                    curl https://cursor.com/install -fsSL | bash\n",
+                )
+                .await;
+                Err(Error::internal_error().data(e.to_string()))
+            }
+        }
     }
 
     /// Cancel the current operation
@@ -99,16 +174,34 @@ impl Session {
     }
 
     /// Process events from Cursor CLI and send ACP updates
-    async fn process_events(&self, process: &mut CursorProcess) -> StopReason {
+    async fn process_events(&self, process: &mut CursorProcess) -> Result<StopReason, Error> {
         while let Some(event) = process.next_event().await {
             match event {
                 StreamEvent::System(sys) => {
                     debug!("Cursor system event: subtype={}", sys.subtype);
                 }
+                StreamEvent::Thinking(thinking) => {
+                    // Send thinking chunks as agent thought
+                    if let Some(text) = &thinking.text {
+                        self.send_agent_thought(text).await;
+                    }
+                }
                 StreamEvent::Assistant(msg) => {
                     // Send assistant message chunks
                     for part in &msg.message.content {
                         if let crate::stream_json::ContentPart::Text { text } = part {
+                            // Check for authentication required message
+                            if text.contains("Authentication required")
+                                || text.contains("Please run 'agent login'")
+                                || text.contains("Please run `/login`")
+                            {
+                                info!("Authentication required detected");
+                                self.send_agent_text(
+                                    "Authentication required. Please use the /login command.\n",
+                                )
+                                .await;
+                                return Err(Error::auth_required());
+                            }
                             self.send_agent_text(text).await;
                         }
                     }
@@ -160,12 +253,24 @@ impl Session {
                 StreamEvent::Result(res) => {
                     if res.is_error {
                         if let Some(error) = &res.error {
+                            // Check for authentication error
+                            if error.contains("Authentication required")
+                                || error.contains("Please run 'agent login'")
+                            {
+                                info!("Authentication required detected in error");
+                                self.send_agent_text(
+                                    "Authentication required. Please use the /login command.\n",
+                                )
+                                .await;
+                                return Err(Error::auth_required());
+                            }
+
                             error!("Cursor error: {}", error);
                             self.send_agent_text(&format!("\n\nError: {}", error)).await;
                         }
                         // Note: StopReason doesn't have Error variant, so we return EndTurn
                         // The error message is sent via agent text above
-                        return StopReason::EndTurn;
+                        return Ok(StopReason::EndTurn);
                     }
                     debug!(
                         "Cursor completed: duration={}ms",
@@ -178,7 +283,7 @@ impl Session {
             }
         }
 
-        StopReason::EndTurn
+        Ok(StopReason::EndTurn)
     }
 
     fn send_error(&self, message: &str) {
@@ -209,6 +314,20 @@ impl Session {
                 .await
             {
                 error!("Failed to send agent text: {:?}", e);
+            }
+        }
+    }
+
+    async fn send_agent_thought(&self, text: &str) {
+        if let Some(client) = ACP_CLIENT.get() {
+            if let Err(e) = client
+                .session_notification(SessionNotification::new(
+                    self.session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(text.to_string().into())),
+                ))
+                .await
+            {
+                error!("Failed to send agent thought: {:?}", e);
             }
         }
     }

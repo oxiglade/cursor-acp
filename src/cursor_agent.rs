@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionId, SetSessionConfigOptionRequest,
+    AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client, ClientCapabilities,
+    Error, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
     SetSessionModelRequest, SetSessionModelResponse,
 };
@@ -22,6 +23,7 @@ use tracing::{debug, info};
 
 use crate::cursor_process::find_cursor_binary;
 use crate::session::Session;
+use crate::ACP_CLIENT;
 
 /// Authentication method for Cursor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,11 +112,8 @@ impl CursorAgent {
 
         let mut methods = Vec::new();
 
-        // Primary: Browser login (if terminal-auth is supported or as default)
-        let mut login_method =
-            AuthMethod::new(CursorAuthMethod::BrowserLogin, "Login with Cursor").description(
-                "Opens a browser to authenticate with your Cursor account",
-            );
+        let mut login_method = AuthMethod::new(CursorAuthMethod::BrowserLogin, "Login with Cursor")
+            .description("Opens a browser to authenticate with your Cursor account");
 
         // If client supports terminal-auth, add metadata for launching the login command
         if supports_terminal_auth {
@@ -132,14 +131,35 @@ impl CursorAgent {
         }
 
         methods.push(login_method);
-
-        // Secondary: API key
         methods.push(
             AuthMethod::new(CursorAuthMethod::ApiKey, "Use API Key")
                 .description("Set the CURSOR_API_KEY environment variable"),
         );
 
         methods
+    }
+
+    /// Build available slash commands
+    fn build_available_commands(&self) -> Vec<AvailableCommand> {
+        vec![AvailableCommand::new(
+            "login",
+            "Authenticate with Cursor via browser login",
+        )]
+    }
+
+    /// Send available commands update to the client
+    fn send_available_commands(&self, session_id: SessionId) {
+        let commands = self.build_available_commands();
+        tokio::task::spawn_local(async move {
+            if let Some(client) = ACP_CLIENT.get() {
+                let update =
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(commands));
+                let notification = SessionNotification::new(session_id, update);
+                if let Err(e) = client.session_notification(notification).await {
+                    tracing::error!("Failed to send available commands: {:?}", e);
+                }
+            }
+        });
     }
 }
 
@@ -192,10 +212,38 @@ impl Agent for CursorAgent {
 
         match auth_method {
             CursorAuthMethod::BrowserLogin => {
-                // The client should have launched `cursor-agent login` via terminal-auth
-                // or the user ran it manually. We assume auth is complete after this.
-                info!("Browser login flow completed");
-                *self.authenticated.borrow_mut() = true;
+                info!("Starting browser login flow");
+
+                // Launch the login command
+                let binary_path = find_cursor_binary().map_err(|e| {
+                    Error::internal_error().data(format!("Cursor CLI not found: {e}"))
+                })?;
+
+                info!("Launching login with binary: {:?}", binary_path);
+
+                let result = tokio::process::Command::new(&binary_path)
+                    .arg("login")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .status()
+                    .await;
+
+                match result {
+                    Ok(status) if status.success() => {
+                        info!("Browser login flow completed successfully");
+                        *self.authenticated.borrow_mut() = true;
+                    }
+                    Ok(status) => {
+                        info!("Login process exited with status: {}", status);
+                        // Still mark as authenticated - user may have completed login
+                        *self.authenticated.borrow_mut() = true;
+                    }
+                    Err(e) => {
+                        return Err(
+                            Error::internal_error().data(format!("Failed to launch login: {e}"))
+                        );
+                    }
+                }
             }
             CursorAuthMethod::ApiKey => {
                 if std::env::var("CURSOR_API_KEY").is_err() {
@@ -237,6 +285,9 @@ impl Agent for CursorAgent {
             .insert(session_id.clone(), session);
 
         debug!("Created new session: {}", session_id.0);
+
+        // Send available commands to the client
+        self.send_available_commands(session_id.clone());
 
         Ok(NewSessionResponse::new(session_id))
     }
