@@ -5,8 +5,8 @@ edition = "2021"
 authors = ["David Chavez <david@dcvz.io>"]
 license = "Apache-2.0"
 description = "An ACP-compatible coding agent adapter for Cursor CLI"
-repository = "https://github.com/oxideai/cursor-acp"
-homepage = "https://github.com/oxideai/cursor-acp"
+repository = "https://github.com/oxiglade/cursor-acp"
+homepage = "https://github.com/oxiglade/cursor-acp"
 keywords = ["acp", "cursor", "ai", "coding-agent"]
 categories = ["development-tools"]
 

@@ -41,7 +41,7 @@ curl https://cursor.com/install -fsSL | bash
 
 #### Installation
 
-Install the adapter from the latest release for your architecture and OS: https://github.com/oxideai/cursor-acp/releases
+Install the adapter from the latest release for your architecture and OS: https://github.com/oxiglade/cursor-acp/releases
 
 You can then use `cursor-acp` as a regular ACP agent:
 
