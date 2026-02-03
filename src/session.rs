@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cursor_process::find_cursor_binary;
@@ -16,9 +17,10 @@ use agent_client_protocol::{
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info};
 
-use crate::cursor_process::CursorProcess;
+use crate::cursor_process::{CursorProcess, CursorProcessParts};
 use crate::stream_json::{StreamEvent, ToolCallSubtype};
 use crate::ACP_CLIENT;
+use tokio::sync::mpsc;
 
 /// A session represents an active conversation with Cursor
 pub struct Session {
@@ -28,7 +30,8 @@ pub struct Session {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     model: RefCell<Option<String>>,
     mode: RefCell<Option<String>>,
-    active_process: TokioMutex<Option<CursorProcess>>,
+    active_child: TokioMutex<Option<tokio::process::Child>>,
+    cancelled: Arc<AtomicBool>,
     /// Cursor CLI's internal session ID for conversation continuity
     cursor_session_id: RefCell<Option<String>>,
 }
@@ -45,7 +48,8 @@ impl Session {
             client_capabilities,
             model: RefCell::new(None),
             mode: RefCell::new(None),
-            active_process: TokioMutex::new(None),
+            active_child: TokioMutex::new(None),
+            cancelled: Arc::new(AtomicBool::new(false)),
             cursor_session_id: RefCell::new(None),
         }
     }
@@ -102,7 +106,7 @@ impl Session {
             info!("Starting new Cursor conversation (no previous session_id)");
         }
 
-        let mut process = CursorProcess::spawn(
+        let process = CursorProcess::spawn(
             &prompt_text,
             Some(self.cwd.as_path()),
             model.as_deref(),
@@ -116,11 +120,15 @@ impl Session {
             Error::internal_error().data(e.to_string())
         })?;
 
-        let result = self.process_events(&mut process).await;
-        drop(process.wait().await);
+        self.cancelled.store(false, Ordering::SeqCst);
+        let CursorProcessParts { child, event_rx } = process.into_parts();
+        *self.active_child.lock().await = Some(child);
 
-        // Clear active process
-        *self.active_process.lock().await = None;
+        let result = self.process_events(event_rx).await;
+
+        if let Some(mut child) = self.active_child.lock().await.take() {
+            drop(child.wait().await);
+        }
 
         result
     }
@@ -197,8 +205,10 @@ impl Session {
 
     /// Cancel the current operation
     pub async fn cancel(&self) {
-        if let Some(mut process) = self.active_process.lock().await.take() {
-            drop(process.kill().await);
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(mut child) = self.active_child.lock().await.take() {
+            drop(child.kill().await);
+            drop(child.wait().await);
         }
     }
 
@@ -225,8 +235,14 @@ impl Session {
     }
 
     /// Process events from Cursor CLI and send ACP updates
-    async fn process_events(&self, process: &mut CursorProcess) -> Result<StopReason, Error> {
-        while let Some(event) = process.next_event().await {
+    async fn process_events(
+        &self,
+        mut event_rx: mpsc::Receiver<StreamEvent>,
+    ) -> Result<StopReason, Error> {
+        while let Some(event) = event_rx.recv().await {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Ok(StopReason::Cancelled);
+            }
             match event {
                 StreamEvent::System(sys) => {
                     debug!("Cursor system event: subtype={}", sys.subtype);
@@ -338,7 +354,11 @@ impl Session {
             }
         }
 
-        Ok(StopReason::EndTurn)
+        if self.cancelled.load(Ordering::SeqCst) {
+            Ok(StopReason::Cancelled)
+        } else {
+            Ok(StopReason::EndTurn)
+        }
     }
 
     fn send_error(&self, message: &str) {

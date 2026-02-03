@@ -55,8 +55,14 @@ pub fn find_cursor_binary() -> Result<PathBuf> {
 
 /// A handle to a running Cursor CLI process
 pub struct CursorProcess {
-    child: Child,
-    event_rx: mpsc::Receiver<StreamEvent>,
+    child: Option<Child>,
+    event_rx: Option<mpsc::Receiver<StreamEvent>>,
+}
+
+/// Separated components of a spawned process.
+pub struct CursorProcessParts {
+    pub child: Child,
+    pub event_rx: mpsc::Receiver<StreamEvent>,
 }
 
 impl CursorProcess {
@@ -151,37 +157,62 @@ impl CursorProcess {
             tracing::debug!("CLI output stream ended");
         });
 
-        Ok(Self { child, event_rx })
+        Ok(Self {
+            child: Some(child),
+            event_rx: Some(event_rx),
+        })
+    }
+
+    /// Consume the process, returning the child handle and event receiver separately.
+    pub fn into_parts(mut self) -> CursorProcessParts {
+        CursorProcessParts {
+            child: self.child.take().expect("into_parts called more than once"),
+            event_rx: self
+                .event_rx
+                .take()
+                .expect("into_parts called more than once"),
+        }
     }
 
     /// Receive the next event from the Cursor CLI
+    #[allow(dead_code)]
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
-        self.event_rx.recv().await
+        self.event_rx.as_mut()?.recv().await
     }
 
     /// Check if the process is still running
     #[allow(dead_code)]
     pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        self.child
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
     }
 
     /// Kill the process
+    #[allow(dead_code)]
     pub async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await.context("failed to kill process")
+        if let Some(ref mut child) = self.child {
+            child.kill().await.context("failed to kill process")
+        } else {
+            Ok(())
+        }
     }
 
     /// Wait for the process to exit
+    #[allow(dead_code)]
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        self.child
-            .wait()
-            .await
-            .context("failed to wait for process")
+        if let Some(ref mut child) = self.child {
+            child.wait().await.context("failed to wait for process")
+        } else {
+            anyhow::bail!("process already taken via into_parts");
+        }
     }
 }
 
 impl Drop for CursorProcess {
     fn drop(&mut self) {
-        // Try to kill the process if it's still running
-        drop(self.child.start_kill());
+        if let Some(ref mut child) = self.child {
+            drop(child.start_kill());
+        }
     }
 }
