@@ -361,6 +361,18 @@ impl Agent for CursorAgent {
             debug!("Restored Cursor session ID: {}", cursor_sid);
         }
 
+        // Restore model selection
+        if let Some(model) = &metadata.model {
+            session.set_model(model.clone());
+            debug!("Restored model: {}", model);
+        }
+
+        // Restore mode selection
+        if let Some(mode) = &metadata.mode {
+            session.set_mode(mode.clone());
+            debug!("Restored mode: {}", mode);
+        }
+
         // Store the session
         self.sessions
             .borrow_mut()
@@ -378,8 +390,14 @@ impl Agent for CursorAgent {
 
         self.send_available_commands(request.session_id.clone());
 
+        // Use persisted mode or default to "default"
+        let selected_mode = match metadata.mode.as_deref() {
+            Some("plan") => "plan",
+            Some("ask") => "ask",
+            _ => "default",
+        };
         let modes = SessionModeState::new(
-            "default",
+            selected_mode,
             vec![
                 SessionMode::new("default", "Default")
                     .description("Normal mode with full tool access"),
@@ -388,8 +406,18 @@ impl Agent for CursorAgent {
             ],
         );
 
+        // Use persisted model or default to "auto"
+        let selected_model = match metadata.model.as_deref() {
+            Some("opus-4.5-thinking") => "opus-4.5-thinking",
+            Some("opus-4.5") => "opus-4.5",
+            Some("sonnet-4.5-thinking") => "sonnet-4.5-thinking",
+            Some("sonnet-4.5") => "sonnet-4.5",
+            Some("gpt-5.2") => "gpt-5.2",
+            Some("gemini-3-pro") => "gemini-3-pro",
+            _ => "auto",
+        };
         let models = SessionModelState::new(
-            "auto",
+            selected_model,
             vec![
                 ModelInfo::new("auto", "Auto"),
                 ModelInfo::new("opus-4.5-thinking", "Claude 4.5 Opus (Thinking)"),
@@ -488,9 +516,10 @@ impl Agent for CursorAgent {
         &self,
         request: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
+        let session_id_str = request.session_id.0.to_string();
         info!(
             "Setting session mode for session: {} to {:?}",
-            request.session_id, request.mode_id
+            session_id_str, request.mode_id
         );
 
         if let Ok(session) = self.get_session(&request.session_id) {
@@ -504,6 +533,11 @@ impl Agent for CursorAgent {
             if let Some(mode) = cursor_mode {
                 session.set_mode(mode.to_string());
             }
+
+            // Persist the mode selection
+            self.session_storage
+                .borrow_mut()
+                .set_mode(&session_id_str, request.mode_id.0.to_string());
         }
 
         Ok(SetSessionModeResponse::default())
@@ -513,13 +547,19 @@ impl Agent for CursorAgent {
         &self,
         request: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
+        let session_id_str = request.session_id.0.to_string();
         info!(
             "Setting session model for session: {} to {:?}",
-            request.session_id, request.model_id
+            session_id_str, request.model_id
         );
 
         if let Ok(session) = self.get_session(&request.session_id) {
             session.set_model(request.model_id.0.to_string());
+
+            // Persist the model selection
+            self.session_storage
+                .borrow_mut()
+                .set_model(&session_id_str, request.model_id.0.to_string());
         }
 
         Ok(SetSessionModelResponse::default())

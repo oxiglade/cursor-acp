@@ -2,8 +2,12 @@
 //!
 //! This module handles individual sessions, spawning Cursor CLI processes,
 //! and translating events to ACP session updates.
+//!
+//! Architecture:
+//! - Messages are sent to a channel and processed sequentially
+//! - A background task handles one CLI invocation at a time
+//! - Prompt calls block until processing completes
 
-use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,26 +18,35 @@ use agent_client_protocol::{
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
     ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
-use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, error, info};
+use tokio::sync::oneshot;
+use tracing::{debug, error, info, warn};
 
 use crate::cursor_process::{CursorProcess, CursorProcessParts};
 use crate::stream_json::{StreamEvent, ToolCallSubtype};
 use crate::ACP_CLIENT;
 use tokio::sync::mpsc;
 
+/// Messages that can be sent to the session's background task
+enum SessionMessage {
+    /// Process a prompt and return the result via the response channel
+    Prompt {
+        prompt_text: String,
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+    },
+    /// Cancel the current operation
+    Cancel { response_tx: oneshot::Sender<()> },
+    /// Set the model for future prompts
+    SetModel { model: String },
+    /// Set the mode for future prompts
+    SetMode { mode: String },
+}
+
 /// A session represents an active conversation with Cursor
 pub struct Session {
-    session_id: SessionId,
-    cwd: PathBuf,
-    #[allow(dead_code)]
-    client_capabilities: Arc<Mutex<ClientCapabilities>>,
-    model: RefCell<Option<String>>,
-    mode: RefCell<Option<String>>,
-    active_child: TokioMutex<Option<tokio::process::Child>>,
-    cancelled: Arc<AtomicBool>,
-    /// Cursor CLI's internal session ID for conversation continuity
-    cursor_session_id: RefCell<Option<String>>,
+    /// Channel to send messages to the background task
+    message_tx: mpsc::Sender<SessionMessage>,
+    /// Cursor CLI's internal session ID for conversation continuity (shared with background task)
+    cursor_session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl Session {
@@ -42,35 +55,43 @@ impl Session {
         cwd: PathBuf,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
     ) -> Self {
-        Self {
-            session_id,
+        let (message_tx, message_rx) = mpsc::channel(32);
+        let cursor_session_id = Arc::new(Mutex::new(None));
+
+        // Spawn the background task that processes messages
+        let worker = SessionWorker::new(
+            session_id.clone(),
             cwd,
             client_capabilities,
-            model: RefCell::new(None),
-            mode: RefCell::new(None),
-            active_child: TokioMutex::new(None),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            cursor_session_id: RefCell::new(None),
+            cursor_session_id.clone(),
+        );
+        tokio::task::spawn_local(worker.run(message_rx));
+
+        Self {
+            message_tx,
+            cursor_session_id,
         }
     }
 
     pub fn set_model(&self, model: String) {
-        *self.model.borrow_mut() = Some(model);
+        // Fire and forget - the worker will pick it up
+        drop(self.message_tx.try_send(SessionMessage::SetModel { model }));
     }
 
     pub fn set_mode(&self, mode: String) {
-        *self.mode.borrow_mut() = Some(mode);
+        drop(self.message_tx.try_send(SessionMessage::SetMode { mode }));
     }
 
     pub fn set_cursor_session_id(&self, id: String) {
-        *self.cursor_session_id.borrow_mut() = Some(id);
+        *self.cursor_session_id.lock().unwrap() = Some(id);
     }
 
     pub fn cursor_session_id(&self) -> Option<String> {
-        self.cursor_session_id.borrow().clone()
+        self.cursor_session_id.lock().unwrap().clone()
     }
 
-    /// Process a prompt request by spawning Cursor CLI
+    /// Process a prompt request by sending it to the background worker.
+    /// Blocks until processing completes, streaming progress via session notifications.
     pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
         let prompt_text = request
             .prompt
@@ -86,9 +107,111 @@ impl Session {
             return Ok(StopReason::EndTurn);
         }
 
+        let (response_tx, response_rx) = oneshot::channel();
+
+        if self
+            .message_tx
+            .send(SessionMessage::Prompt {
+                prompt_text,
+                response_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Error::internal_error().data("Session worker has stopped"));
+        }
+
+        // Wait for the worker to complete processing
+        response_rx
+            .await
+            .map_err(|_| Error::internal_error().data("Session worker dropped response channel"))?
+    }
+
+    /// Cancel the current operation
+    pub async fn cancel(&self) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .message_tx
+            .send(SessionMessage::Cancel { response_tx })
+            .await
+            .is_ok()
+        {
+            // Wait for acknowledgment
+            drop(response_rx.await);
+        }
+    }
+}
+
+/// Background worker that processes session messages sequentially
+struct SessionWorker {
+    session_id: SessionId,
+    cwd: PathBuf,
+    #[allow(dead_code)]
+    client_capabilities: Arc<Mutex<ClientCapabilities>>,
+    model: Option<String>,
+    mode: Option<String>,
+    active_child: Option<tokio::process::Child>,
+    cancelled: Arc<AtomicBool>,
+    cursor_session_id: Arc<Mutex<Option<String>>>,
+}
+
+impl SessionWorker {
+    fn new(
+        session_id: SessionId,
+        cwd: PathBuf,
+        client_capabilities: Arc<Mutex<ClientCapabilities>>,
+        cursor_session_id: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            session_id,
+            cwd,
+            client_capabilities,
+            model: None,
+            mode: None,
+            active_child: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cursor_session_id,
+        }
+    }
+
+    /// Main loop that processes messages from the channel
+    async fn run(mut self, mut message_rx: mpsc::Receiver<SessionMessage>) {
+        info!("Session worker started for {}", self.session_id.0);
+
+        while let Some(msg) = message_rx.recv().await {
+            match msg {
+                SessionMessage::Prompt {
+                    prompt_text,
+                    response_tx,
+                } => {
+                    let result = self.handle_prompt(prompt_text).await;
+                    if let Err(ref e) = result {
+                        self.send_agent_text(&format!("\n\nError: {}\n", e.message))
+                            .await;
+                    }
+                    drop(response_tx.send(result));
+                }
+                SessionMessage::Cancel { response_tx } => {
+                    self.handle_cancel().await;
+                    let _ = response_tx.send(());
+                }
+                SessionMessage::SetModel { model } => {
+                    self.model = Some(model);
+                }
+                SessionMessage::SetMode { mode } => {
+                    self.mode = Some(mode);
+                }
+            }
+        }
+
+        info!("Session worker stopped for {}", self.session_id.0);
+    }
+
+    /// Handle a prompt message
+    async fn handle_prompt(&mut self, prompt_text: String) -> Result<StopReason, Error> {
         info!("Received prompt text: {:?}", prompt_text);
 
-        // Handle /login command (with or without leading slash)
+        // Handle /login command
         let trimmed = prompt_text.trim();
         if trimmed == "/login" || trimmed == "login" {
             return self.handle_login_command().await;
@@ -96,9 +219,7 @@ impl Session {
 
         info!("Processing prompt: {}", truncate(&prompt_text, 100));
 
-        let model = self.model.borrow().clone();
-        let mode = self.mode.borrow().clone();
-        let resume_session_id = self.cursor_session_id.borrow().clone();
+        let resume_session_id = self.cursor_session_id.lock().unwrap().clone();
 
         if let Some(ref sid) = resume_session_id {
             info!("Resuming Cursor conversation (session_id={})", sid);
@@ -109,8 +230,8 @@ impl Session {
         let process = CursorProcess::spawn(
             &prompt_text,
             Some(self.cwd.as_path()),
-            model.as_deref(),
-            mode.as_deref(),
+            self.model.as_deref(),
+            self.mode.as_deref(),
             resume_session_id.as_deref(),
         )
         .await
@@ -122,19 +243,19 @@ impl Session {
 
         self.cancelled.store(false, Ordering::SeqCst);
         let CursorProcessParts { child, event_rx } = process.into_parts();
-        *self.active_child.lock().await = Some(child);
+        self.active_child = Some(child);
 
         let result = self.process_events(event_rx).await;
 
-        if let Some(mut child) = self.active_child.lock().await.take() {
+        if let Some(mut child) = self.active_child.take() {
             drop(child.wait().await);
         }
 
         result
     }
 
-    /// Handle the /login command by launching the cursor-agent login flow
-    async fn handle_login_command(&self) -> Result<StopReason, Error> {
+    /// Handle the /login command
+    async fn handle_login_command(&mut self) -> Result<StopReason, Error> {
         info!("Handling /login command");
 
         match find_cursor_binary() {
@@ -143,7 +264,6 @@ impl Session {
                 self.send_agent_text("Launching Cursor login flow...\n")
                     .await;
 
-                // Launch the login command with output capture for debugging
                 let result = tokio::process::Command::new(&binary_path)
                     .arg("login")
                     .stdout(std::process::Stdio::piped())
@@ -203,40 +323,37 @@ impl Session {
         }
     }
 
-    /// Cancel the current operation
-    pub async fn cancel(&self) {
+    /// Handle cancel request
+    async fn handle_cancel(&mut self) {
+        info!("Cancelling current operation");
         self.cancelled.store(true, Ordering::SeqCst);
-        if let Some(mut child) = self.active_child.lock().await.take() {
+        if let Some(mut child) = self.active_child.take() {
             drop(child.kill().await);
             drop(child.wait().await);
         }
     }
 
-    /// Capture Cursor CLI session ID from any event that carries it
+    /// Capture Cursor CLI session ID from events
     fn capture_cursor_session_id_if_present(&self, new_session_id: Option<&String>) {
         if let Some(new_id) = new_session_id {
-            let current_id = self.cursor_session_id.borrow().clone();
-
-            match &current_id {
-                Some(old_id) if old_id != new_id => {
-                    error!(
+            let mut current = self.cursor_session_id.lock().unwrap();
+            if let Some(ref old_id) = *current {
+                if old_id != new_id {
+                    warn!(
                         "Cursor session ID changed unexpectedly: {} -> {}",
                         old_id, new_id
                     );
                 }
-                None => {
-                    debug!("Captured Cursor session ID: {}", new_id);
-                }
-                _ => {}
+            } else {
+                debug!("Captured Cursor session ID: {}", new_id);
             }
-
-            *self.cursor_session_id.borrow_mut() = Some(new_id.clone());
+            *current = Some(new_id.clone());
         }
     }
 
-    /// Process events from Cursor CLI and send ACP updates
+    /// Process events from Cursor CLI
     async fn process_events(
-        &self,
+        &mut self,
         mut event_rx: mpsc::Receiver<StreamEvent>,
     ) -> Result<StopReason, Error> {
         while let Some(event) = event_rx.recv().await {
@@ -250,7 +367,6 @@ impl Session {
                 }
                 StreamEvent::Thinking(thinking) => {
                     self.capture_cursor_session_id_if_present(thinking.session_id.as_ref());
-                    // Send thinking chunks as agent thought
                     if let Some(text) = &thinking.text {
                         self.send_agent_thought(text).await;
                     }
@@ -258,7 +374,6 @@ impl Session {
                 StreamEvent::Assistant(msg) => {
                     for part in &msg.message.content {
                         if let crate::stream_json::ContentPart::Text { text } = part {
-                            // Check for authentication required message
                             if text.contains("Authentication required")
                                 || text.contains("Please run 'agent login'")
                                 || text.contains("Please run `/login`")
@@ -282,7 +397,6 @@ impl Session {
 
                     match tc.subtype {
                         ToolCallSubtype::Started => {
-                            // Log unknown tool types for discovery
                             if tool_name == "tool" {
                                 if let Some(key) = tool_key {
                                     info!("Unknown tool type discovered: {} - please report this so we can add support", key);
@@ -304,7 +418,6 @@ impl Session {
                                 tool_call = tool_call.raw_input(args.clone());
                             }
 
-                            // Extract file locations for "follow the agent" feature
                             let locations = extract_tool_locations(&tc);
                             if !locations.is_empty() {
                                 tool_call = tool_call.locations(locations);
@@ -318,11 +431,9 @@ impl Session {
                             let mut fields =
                                 ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
 
-                            // Try to get result from the new nested structure first
                             if let Some(result_data) = tc.get_result_data() {
                                 fields = fields.raw_output(result_data.clone());
                             } else if let Some(result) = &tc.result {
-                                // Fall back to legacy result structure
                                 if let Some(output) = &result.output {
                                     fields = fields
                                         .raw_output(serde_json::Value::String(output.clone()));
@@ -345,7 +456,6 @@ impl Session {
 
                     if res.is_error {
                         if let Some(error) = &res.error {
-                            // Check for authentication error
                             if error.contains("Authentication required")
                                 || error.contains("Please run 'agent login'")
                             {
@@ -360,8 +470,6 @@ impl Session {
                             error!("Cursor error: {}", error);
                             self.send_agent_text(&format!("\n\nError: {}", error)).await;
                         }
-                        // Note: StopReason doesn't have Error variant, so we return EndTurn
-                        // The error message is sent via agent text above
                         return Ok(StopReason::EndTurn);
                     }
                     debug!(
@@ -370,7 +478,7 @@ impl Session {
                     );
                 }
                 StreamEvent::User(_) => {
-                    // User messages are echoed back, we can ignore
+                    // User messages are echoed back, ignore
                 }
             }
         }
@@ -383,7 +491,6 @@ impl Session {
     }
 
     fn send_error(&self, message: &str) {
-        // Fire and forget error notification
         let session_id = self.session_id.clone();
         let message = message.to_string();
         tokio::task::spawn_local(async move {

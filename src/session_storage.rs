@@ -31,6 +31,12 @@ pub struct SessionMetadata {
     /// Cursor CLI's internal session ID for conversation continuity
     #[serde(default)]
     pub cursor_session_id: Option<String>,
+    /// Selected model for this session
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Selected mode for this session
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 impl SessionMetadata {
@@ -44,6 +50,8 @@ impl SessionMetadata {
             created_at: now,
             updated_at: now,
             cursor_session_id: None,
+            model: None,
+            mode: None,
         }
     }
 
@@ -150,6 +158,22 @@ impl SessionStorage {
     pub fn set_cursor_session_id(&mut self, session_id: &str, cursor_session_id: String) {
         if let Some(meta) = self.sessions.get_mut(session_id) {
             meta.cursor_session_id = Some(cursor_session_id);
+            self.save();
+        }
+    }
+
+    /// Update a session's model
+    pub fn set_model(&mut self, session_id: &str, model: String) {
+        if let Some(meta) = self.sessions.get_mut(session_id) {
+            meta.model = Some(model);
+            self.save();
+        }
+    }
+
+    /// Update a session's mode
+    pub fn set_mode(&mut self, session_id: &str, mode: String) {
+        if let Some(meta) = self.sessions.get_mut(session_id) {
+            meta.mode = Some(mode);
             self.save();
         }
     }
