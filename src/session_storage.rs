@@ -31,12 +31,6 @@ pub struct SessionMetadata {
     /// Cursor CLI's internal session ID for conversation continuity
     #[serde(default)]
     pub cursor_session_id: Option<String>,
-    /// Selected model for this session
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Selected mode for this session
-    #[serde(default)]
-    pub mode: Option<String>,
 }
 
 impl SessionMetadata {
@@ -50,8 +44,6 @@ impl SessionMetadata {
             created_at: now,
             updated_at: now,
             cursor_session_id: None,
-            model: None,
-            mode: None,
         }
     }
 
@@ -73,6 +65,12 @@ impl SessionMetadata {
 pub struct SessionStorage {
     /// Map of session ID to metadata
     sessions: HashMap<String, SessionMetadata>,
+    /// Global preference: last selected model (used for new sessions)
+    #[serde(default)]
+    pub last_model: Option<String>,
+    /// Global preference: last selected mode (used for new sessions)
+    #[serde(default)]
+    pub last_mode: Option<String>,
 }
 
 impl SessionStorage {
@@ -162,20 +160,16 @@ impl SessionStorage {
         }
     }
 
-    /// Update a session's model
-    pub fn set_model(&mut self, session_id: &str, model: String) {
-        if let Some(meta) = self.sessions.get_mut(session_id) {
-            meta.model = Some(model);
-            self.save();
-        }
+    /// Update the global model preference
+    pub fn set_model(&mut self, model: String) {
+        self.last_model = Some(model);
+        self.save();
     }
 
-    /// Update a session's mode
-    pub fn set_mode(&mut self, session_id: &str, mode: String) {
-        if let Some(meta) = self.sessions.get_mut(session_id) {
-            meta.mode = Some(mode);
-            self.save();
-        }
+    /// Update the global mode preference
+    pub fn set_mode(&mut self, mode: String) {
+        self.last_mode = Some(mode);
+        self.save();
     }
 
     /// Mark a session as recently active

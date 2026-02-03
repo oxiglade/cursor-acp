@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cursor_process::find_cursor_binary;
+use crate::message_history::{HistoryMessage, MessageHistory};
 use agent_client_protocol::{
     Client, ClientCapabilities, ContentBlock, ContentChunk, Error, PromptRequest, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
@@ -43,6 +44,8 @@ enum SessionMessage {
 
 /// A session represents an active conversation with Cursor
 pub struct Session {
+    /// The session ID
+    session_id: SessionId,
     /// Channel to send messages to the background task
     message_tx: mpsc::Sender<SessionMessage>,
     /// Cursor CLI's internal session ID for conversation continuity (shared with background task)
@@ -68,6 +71,7 @@ impl Session {
         tokio::task::spawn_local(worker.run(message_rx));
 
         Self {
+            session_id,
             message_tx,
             cursor_session_id,
         }
@@ -88,6 +92,11 @@ impl Session {
 
     pub fn cursor_session_id(&self) -> Option<String> {
         self.cursor_session_id.lock().unwrap().clone()
+    }
+
+    /// Load message history for this session (for replay on session load)
+    pub fn load_message_history(&self) -> MessageHistory {
+        MessageHistory::load(self.session_id.0.as_ref())
     }
 
     /// Process a prompt request by sending it to the background worker.
@@ -153,6 +162,10 @@ struct SessionWorker {
     active_child: Option<tokio::process::Child>,
     cancelled: Arc<AtomicBool>,
     cursor_session_id: Arc<Mutex<Option<String>>>,
+    /// Message history for this session
+    message_history: MessageHistory,
+    /// Buffer for accumulating agent response text
+    agent_text_buffer: String,
 }
 
 impl SessionWorker {
@@ -162,6 +175,14 @@ impl SessionWorker {
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         cursor_session_id: Arc<Mutex<Option<String>>>,
     ) -> Self {
+        // Load existing message history for this session
+        let message_history = MessageHistory::load(&session_id.0);
+        info!(
+            "Loaded {} messages from history for session {}",
+            message_history.len(),
+            session_id.0
+        );
+
         Self {
             session_id,
             cwd,
@@ -171,6 +192,8 @@ impl SessionWorker {
             active_child: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             cursor_session_id,
+            message_history,
+            agent_text_buffer: String::new(),
         }
     }
 
@@ -218,6 +241,13 @@ impl SessionWorker {
         }
 
         info!("Processing prompt: {}", truncate(&prompt_text, 100));
+
+        // Record the user message in history
+        self.message_history
+            .push(HistoryMessage::user(&prompt_text));
+
+        // Clear the agent text buffer for this turn
+        self.agent_text_buffer.clear();
 
         let resume_session_id = self.cursor_session_id.lock().unwrap().clone();
 
@@ -385,6 +415,8 @@ impl SessionWorker {
                                 .await;
                                 return Err(Error::auth_required());
                             }
+                            // Buffer agent text for history
+                            self.agent_text_buffer.push_str(text);
                             self.send_agent_text(text).await;
                         }
                     }
@@ -407,12 +439,24 @@ impl SessionWorker {
                                 tc.call_id, tool_name, tool_key
                             );
 
-                            let mut tool_call = ToolCall::new(
-                                ToolCallId::new(tc.call_id.clone()),
-                                format_tool_title(tool_name, tool_key, &arguments),
-                            )
-                            .kind(map_tool_kind(tool_name))
-                            .status(ToolCallStatus::InProgress);
+                            let title = format_tool_title(tool_name, tool_key, &arguments);
+                            let kind = map_tool_kind(tool_name);
+
+                            // Record tool call in history
+                            let mut history_msg = HistoryMessage::tool_call(
+                                &tc.call_id,
+                                &title,
+                                format!("{:?}", kind),
+                            );
+                            if let HistoryMessage::ToolCall { ref mut input, .. } = history_msg {
+                                *input = arguments.clone();
+                            }
+                            self.message_history.push(history_msg);
+
+                            let mut tool_call =
+                                ToolCall::new(ToolCallId::new(tc.call_id.clone()), title)
+                                    .kind(kind)
+                                    .status(ToolCallStatus::InProgress);
 
                             if let Some(args) = &arguments {
                                 tool_call = tool_call.raw_input(args.clone());
@@ -431,17 +475,31 @@ impl SessionWorker {
                             let mut fields =
                                 ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
 
-                            if let Some(result_data) = tc.get_result_data() {
+                            let output = if let Some(result_data) = tc.get_result_data() {
                                 fields = fields.raw_output(result_data.clone());
+                                Some(result_data.clone())
                             } else if let Some(result) = &tc.result {
                                 if let Some(output) = &result.output {
-                                    fields = fields
-                                        .raw_output(serde_json::Value::String(output.clone()));
+                                    let val = serde_json::Value::String(output.clone());
+                                    fields = fields.raw_output(val.clone());
+                                    Some(val)
+                                } else if let Some(error) = &result.error {
+                                    let val = serde_json::json!({"error": error});
+                                    fields = fields.raw_output(val.clone());
+                                    Some(val)
+                                } else {
+                                    None
                                 }
-                                if let Some(error) = &result.error {
-                                    fields = fields.raw_output(serde_json::json!({"error": error}));
-                                }
-                            }
+                            } else {
+                                None
+                            };
+
+                            // Update tool call in history
+                            self.message_history.complete_tool_call(
+                                &tc.call_id,
+                                output,
+                                "completed",
+                            );
 
                             self.send_tool_call_update(ToolCallUpdate::new(
                                 ToolCallId::new(tc.call_id.clone()),
@@ -481,6 +539,13 @@ impl SessionWorker {
                     // User messages are echoed back, ignore
                 }
             }
+        }
+
+        // Save any accumulated agent text to history
+        if !self.agent_text_buffer.is_empty() {
+            self.message_history
+                .push(HistoryMessage::agent(&self.agent_text_buffer));
+            self.agent_text_buffer.clear();
         }
 
         if self.cancelled.load(Ordering::SeqCst) {

@@ -12,16 +12,19 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client, ClientCapabilities,
-    Error, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelInfo, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionId, SessionInfo, SessionMode, SessionModeState, SessionModelState, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    ContentChunk, Error, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelInfo,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, SessionId, SessionInfo, SessionMode, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse, ToolCall, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use tracing::{debug, info};
 
 use crate::cursor_process::find_cursor_binary;
+use crate::message_history::HistoryMessage;
 use crate::session::Session;
 use crate::session_storage::{generate_title, SessionMetadata, SessionStorage};
 use crate::ACP_CLIENT;
@@ -172,6 +175,103 @@ impl CursorAgent {
             }
         });
     }
+
+    /// Stream message history to the client for a loaded session
+    async fn stream_history(&self, session_id: &SessionId, session: &Session) {
+        let history = session.load_message_history();
+
+        if history.is_empty() {
+            debug!("No message history to stream for session {}", session_id.0);
+            return;
+        }
+
+        info!(
+            "Streaming {} messages from history for session {}",
+            history.len(),
+            session_id.0
+        );
+
+        let Some(client) = ACP_CLIENT.get() else {
+            return;
+        };
+
+        for message in history.messages {
+            let update = match message {
+                HistoryMessage::User { content, .. } => {
+                    SessionUpdate::UserMessageChunk(ContentChunk::new(content.into()))
+                }
+                HistoryMessage::Agent { content, .. } => {
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(content.into()))
+                }
+                HistoryMessage::Thought { content, .. } => {
+                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(content.into()))
+                }
+                HistoryMessage::ToolCall {
+                    call_id,
+                    title,
+                    kind,
+                    input,
+                    output,
+                    status,
+                    ..
+                } => {
+                    // First send the tool call
+                    let tool_kind = match kind.as_str() {
+                        "Read" => ToolKind::Read,
+                        "Edit" => ToolKind::Edit,
+                        "Delete" => ToolKind::Delete,
+                        "Execute" => ToolKind::Execute,
+                        "Search" => ToolKind::Search,
+                        "Fetch" => ToolKind::Fetch,
+                        "Think" => ToolKind::Think,
+                        _ => ToolKind::Other,
+                    };
+
+                    let mut tool_call = ToolCall::new(ToolCallId::new(call_id.clone()), title)
+                        .kind(tool_kind)
+                        .status(ToolCallStatus::Completed);
+
+                    if let Some(inp) = input {
+                        tool_call = tool_call.raw_input(inp);
+                    }
+                    if let Some(out) = &output {
+                        tool_call = tool_call.raw_output(out.clone());
+                    }
+
+                    // Send the tool call
+                    let notification = SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCall(tool_call),
+                    );
+                    if let Err(e) = client.session_notification(notification).await {
+                        tracing::error!("Failed to stream tool call: {:?}", e);
+                    }
+
+                    // Send completion update if completed
+                    if status == "completed" {
+                        let mut fields =
+                            ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+                        if let Some(out) = output {
+                            fields = fields.raw_output(out);
+                        }
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            ToolCallId::new(call_id),
+                            fields,
+                        ))
+                    } else {
+                        continue; // Skip sending update for incomplete tools
+                    }
+                }
+            };
+
+            let notification = SessionNotification::new(session_id.clone(), update);
+            if let Err(e) = client.session_notification(notification).await {
+                tracing::error!("Failed to stream history message: {:?}", e);
+            }
+        }
+
+        debug!("Finished streaming history for session {}", session_id.0);
+    }
 }
 
 impl Default for CursorAgent {
@@ -284,11 +384,37 @@ impl Agent for CursorAgent {
             .unwrap()
             .insert(session_id.clone(), cwd.clone());
 
+        let (selected_mode, selected_model) = {
+            let storage = self.session_storage.borrow();
+            let mode = match storage.last_mode.as_deref() {
+                Some("plan") => "plan",
+                Some("ask") => "ask",
+                _ => "default",
+            };
+            let model = match storage.last_model.as_deref() {
+                Some("opus-4.5-thinking") => "opus-4.5-thinking",
+                Some("opus-4.5") => "opus-4.5",
+                Some("sonnet-4.5-thinking") => "sonnet-4.5-thinking",
+                Some("sonnet-4.5") => "sonnet-4.5",
+                Some("gpt-5.2") => "gpt-5.2",
+                Some("gemini-3-pro") => "gemini-3-pro",
+                _ => "auto",
+            };
+            (mode, model)
+        };
+
         let session = Rc::new(Session::new(
             session_id.clone(),
             cwd.clone(),
             self.client_capabilities.clone(),
         ));
+
+        if selected_model != "auto" {
+            session.set_model(selected_model.to_string());
+        }
+        if selected_mode != "default" {
+            session.set_mode(selected_mode.to_string());
+        }
 
         self.sessions
             .borrow_mut()
@@ -303,7 +429,7 @@ impl Agent for CursorAgent {
         self.send_available_commands(session_id.clone());
 
         let modes = SessionModeState::new(
-            "default",
+            selected_mode,
             vec![
                 SessionMode::new("default", "Default")
                     .description("Normal mode with full tool access"),
@@ -313,7 +439,7 @@ impl Agent for CursorAgent {
         );
 
         let models = SessionModelState::new(
-            "auto",
+            selected_model,
             vec![
                 ModelInfo::new("auto", "Auto"),
                 ModelInfo::new("opus-4.5-thinking", "Claude 4.5 Opus (Thinking)"),
@@ -361,17 +487,18 @@ impl Agent for CursorAgent {
             debug!("Restored Cursor session ID: {}", cursor_sid);
         }
 
-        // Restore model selection
-        if let Some(model) = &metadata.model {
-            session.set_model(model.clone());
-            debug!("Restored model: {}", model);
+        {
+            let storage = self.session_storage.borrow();
+            if let Some(model) = &storage.last_model {
+                session.set_model(model.clone());
+            }
+            if let Some(mode) = &storage.last_mode {
+                session.set_mode(mode.clone());
+            }
         }
 
-        // Restore mode selection
-        if let Some(mode) = &metadata.mode {
-            session.set_mode(mode.clone());
-            debug!("Restored mode: {}", mode);
-        }
+        // Stream conversation history to the client before storing
+        self.stream_history(&request.session_id, &session).await;
 
         // Store the session
         self.sessions
@@ -390,12 +517,25 @@ impl Agent for CursorAgent {
 
         self.send_available_commands(request.session_id.clone());
 
-        // Use persisted mode or default to "default"
-        let selected_mode = match metadata.mode.as_deref() {
-            Some("plan") => "plan",
-            Some("ask") => "ask",
-            _ => "default",
+        let (selected_mode, selected_model) = {
+            let storage = self.session_storage.borrow();
+            let mode = match storage.last_mode.as_deref() {
+                Some("plan") => "plan",
+                Some("ask") => "ask",
+                _ => "default",
+            };
+            let model = match storage.last_model.as_deref() {
+                Some("opus-4.5-thinking") => "opus-4.5-thinking",
+                Some("opus-4.5") => "opus-4.5",
+                Some("sonnet-4.5-thinking") => "sonnet-4.5-thinking",
+                Some("sonnet-4.5") => "sonnet-4.5",
+                Some("gpt-5.2") => "gpt-5.2",
+                Some("gemini-3-pro") => "gemini-3-pro",
+                _ => "auto",
+            };
+            (mode, model)
         };
+
         let modes = SessionModeState::new(
             selected_mode,
             vec![
@@ -406,16 +546,6 @@ impl Agent for CursorAgent {
             ],
         );
 
-        // Use persisted model or default to "auto"
-        let selected_model = match metadata.model.as_deref() {
-            Some("opus-4.5-thinking") => "opus-4.5-thinking",
-            Some("opus-4.5") => "opus-4.5",
-            Some("sonnet-4.5-thinking") => "sonnet-4.5-thinking",
-            Some("sonnet-4.5") => "sonnet-4.5",
-            Some("gpt-5.2") => "gpt-5.2",
-            Some("gemini-3-pro") => "gemini-3-pro",
-            _ => "auto",
-        };
         let models = SessionModelState::new(
             selected_model,
             vec![
@@ -516,11 +646,7 @@ impl Agent for CursorAgent {
         &self,
         request: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
-        let session_id_str = request.session_id.0.to_string();
-        info!(
-            "Setting session mode for session: {} to {:?}",
-            session_id_str, request.mode_id
-        );
+        info!("Setting mode to {:?}", request.mode_id);
 
         if let Ok(session) = self.get_session(&request.session_id) {
             // Map ACP mode IDs to Cursor CLI modes
@@ -533,12 +659,11 @@ impl Agent for CursorAgent {
             if let Some(mode) = cursor_mode {
                 session.set_mode(mode.to_string());
             }
-
-            // Persist the mode selection
-            self.session_storage
-                .borrow_mut()
-                .set_mode(&session_id_str, request.mode_id.0.to_string());
         }
+
+        self.session_storage
+            .borrow_mut()
+            .set_mode(request.mode_id.0.to_string());
 
         Ok(SetSessionModeResponse::default())
     }
@@ -547,20 +672,15 @@ impl Agent for CursorAgent {
         &self,
         request: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
-        let session_id_str = request.session_id.0.to_string();
-        info!(
-            "Setting session model for session: {} to {:?}",
-            session_id_str, request.model_id
-        );
+        info!("Setting model to {:?}", request.model_id);
 
         if let Ok(session) = self.get_session(&request.session_id) {
             session.set_model(request.model_id.0.to_string());
-
-            // Persist the model selection
-            self.session_storage
-                .borrow_mut()
-                .set_model(&session_id_str, request.model_id.0.to_string());
         }
+
+        self.session_storage
+            .borrow_mut()
+            .set_model(request.model_id.0.to_string());
 
         Ok(SetSessionModelResponse::default())
     }

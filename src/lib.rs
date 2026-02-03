@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 mod cursor_agent;
 mod cursor_process;
+mod message_history;
 mod session;
 mod session_storage;
 mod stream_json;
