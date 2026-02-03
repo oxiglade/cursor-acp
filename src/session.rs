@@ -12,7 +12,7 @@ use crate::cursor_process::find_cursor_binary;
 use agent_client_protocol::{
     Client, ClientCapabilities, ContentBlock, ContentChunk, Error, PromptRequest, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info};
@@ -277,15 +277,25 @@ impl Session {
                 StreamEvent::ToolCall(tc) => {
                     self.capture_cursor_session_id_if_present(tc.session_id.as_ref());
                     let tool_name = tc.get_tool_name().unwrap_or("unknown");
+                    let tool_key = tc.get_tool_call_key();
                     let arguments = tc.get_arguments().cloned();
 
                     match tc.subtype {
                         ToolCallSubtype::Started => {
-                            debug!("Tool call started: {} - {}", tc.call_id, tool_name);
+                            // Log unknown tool types for discovery
+                            if tool_name == "tool" {
+                                if let Some(key) = tool_key {
+                                    info!("Unknown tool type discovered: {} - please report this so we can add support", key);
+                                }
+                            }
+                            debug!(
+                                "Tool call started: {} - {} (key: {:?})",
+                                tc.call_id, tool_name, tool_key
+                            );
 
                             let mut tool_call = ToolCall::new(
                                 ToolCallId::new(tc.call_id.clone()),
-                                format_tool_title(tool_name, &arguments),
+                                format_tool_title(tool_name, tool_key, &arguments),
                             )
                             .kind(map_tool_kind(tool_name))
                             .status(ToolCallStatus::InProgress);
@@ -293,6 +303,13 @@ impl Session {
                             if let Some(args) = &arguments {
                                 tool_call = tool_call.raw_input(args.clone());
                             }
+
+                            // Extract file locations for "follow the agent" feature
+                            let locations = extract_tool_locations(&tc);
+                            if !locations.is_empty() {
+                                tool_call = tool_call.locations(locations);
+                            }
+
                             self.send_tool_call(tool_call).await;
                         }
                         ToolCallSubtype::Completed => {
@@ -301,7 +318,11 @@ impl Session {
                             let mut fields =
                                 ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
 
-                            if let Some(result) = &tc.result {
+                            // Try to get result from the new nested structure first
+                            if let Some(result_data) = tc.get_result_data() {
+                                fields = fields.raw_output(result_data.clone());
+                            } else if let Some(result) = &tc.result {
+                                // Fall back to legacy result structure
                                 if let Some(output) = &result.output {
                                     fields = fields
                                         .raw_output(serde_json::Value::String(output.clone()));
@@ -436,6 +457,8 @@ impl Session {
     }
 }
 
+use crate::stream_json::ToolCallEvent;
+
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
@@ -444,7 +467,43 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-fn format_tool_title(tool_name: &str, arguments: &Option<serde_json::Value>) -> String {
+/// Extract file locations from a tool call for the "follow the agent" feature.
+/// This enables clients to track which files the agent is working with in real-time.
+fn extract_tool_locations(tc: &ToolCallEvent) -> Vec<ToolCallLocation> {
+    let mut locations = Vec::new();
+
+    // Extract primary file path
+    if let Some(path) = tc.get_file_path() {
+        let mut location = ToolCallLocation::new(path);
+
+        // Add line number if available
+        if let Some(line) = tc.get_line_number() {
+            location = location.line(line);
+        }
+
+        locations.push(location);
+    }
+
+    // For shell commands, add working directory as a location
+    if let Some(tool_key) = tc.get_tool_call_key() {
+        if tool_key == "shellToolCall" || tool_key == "bashToolCall" {
+            if let Some(cwd) = tc.get_working_directory() {
+                // Only add if not already present
+                if !locations.iter().any(|l| l.path.to_string_lossy() == cwd) {
+                    locations.push(ToolCallLocation::new(cwd));
+                }
+            }
+        }
+    }
+
+    locations
+}
+
+fn format_tool_title(
+    tool_name: &str,
+    tool_key: Option<&str>,
+    arguments: &Option<serde_json::Value>,
+) -> String {
     match tool_name {
         "readFile" | "read_file" => {
             if let Some(args) = arguments {
@@ -462,7 +521,23 @@ fn format_tool_title(tool_name: &str, arguments: &Option<serde_json::Value>) -> 
             }
             "Write file".to_string()
         }
-        "runCommand" | "run_command" | "execute" => {
+        "edit" => {
+            if let Some(args) = arguments {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    return format!("Edit {}", path);
+                }
+            }
+            "Edit file".to_string()
+        }
+        "delete" => {
+            if let Some(args) = arguments {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    return format!("Delete {}", path);
+                }
+            }
+            "Delete file".to_string()
+        }
+        "shell" | "bash" | "execute" => {
             if let Some(args) = arguments {
                 if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
                     return format!("Run: {}", truncate(cmd, 50));
@@ -470,17 +545,91 @@ fn format_tool_title(tool_name: &str, arguments: &Option<serde_json::Value>) -> 
             }
             "Run command".to_string()
         }
+        "ls" => {
+            if let Some(args) = arguments {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    return format!("List {}", path);
+                }
+                if let Some(dir) = args.get("directory").and_then(|v| v.as_str()) {
+                    return format!("List {}", dir);
+                }
+            }
+            "List directory".to_string()
+        }
+        "grep" => {
+            if let Some(args) = arguments {
+                if let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) {
+                    return format!("Grep: {}", truncate(pattern, 30));
+                }
+            }
+            "Search with grep".to_string()
+        }
+        "glob" => {
+            if let Some(args) = arguments {
+                if let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) {
+                    return format!("Glob: {}", truncate(pattern, 30));
+                }
+            }
+            "Find files".to_string()
+        }
+        "search" | "find" => {
+            if let Some(args) = arguments {
+                if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
+                    return format!("Search: {}", truncate(query, 30));
+                }
+            }
+            "Search".to_string()
+        }
+        "fetch" => {
+            if let Some(args) = arguments {
+                if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
+                    return format!("Fetch {}", truncate(url, 40));
+                }
+            }
+            "Fetch URL".to_string()
+        }
+        "think" => "Thinking...".to_string(),
+        // For unknown tools, try to make a readable title from the raw key
+        "tool" => {
+            if let Some(key) = tool_key {
+                // Convert "somethingToolCall" to "Something"
+                let name = key
+                    .strip_suffix("ToolCall")
+                    .or_else(|| key.strip_suffix("Tool"))
+                    .unwrap_or(key);
+                // Capitalize first letter
+                let mut chars = name.chars();
+                match chars.next() {
+                    Some(first) => {
+                        format!("{}{}", first.to_uppercase(), chars.as_str())
+                    }
+                    None => "Tool".to_string(),
+                }
+            } else {
+                "Tool".to_string()
+            }
+        }
         _ => tool_name.to_string(),
     }
 }
 
 fn map_tool_kind(tool_name: &str) -> ToolKind {
     match tool_name {
-        "readFile" | "read_file" => ToolKind::Read,
-        "writeFile" | "write_file" | "edit" | "patch" => ToolKind::Edit,
-        "runCommand" | "run_command" | "execute" | "shell" => ToolKind::Execute,
-        "search" | "grep" | "find" => ToolKind::Search,
-        "fetch" | "http" | "web" => ToolKind::Fetch,
+        // Read operations
+        "readFile" | "read_file" | "read" => ToolKind::Read,
+        // Edit/write operations
+        "writeFile" | "write_file" | "write" | "edit" | "patch" => ToolKind::Edit,
+        // Delete operations
+        "delete" | "remove" | "rm" => ToolKind::Delete,
+        // Execute operations
+        "shell" | "bash" | "execute" | "run" | "terminal" => ToolKind::Execute,
+        // Search operations
+        "search" | "grep" | "glob" | "find" | "ls" => ToolKind::Search,
+        // Fetch operations
+        "fetch" | "http" | "web" | "curl" => ToolKind::Fetch,
+        // Think operations
+        "think" | "reasoning" => ToolKind::Think,
+        // Default
         _ => ToolKind::Other,
     }
 }

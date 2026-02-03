@@ -107,6 +107,16 @@ impl ToolCallEvent {
         None
     }
 
+    /// Get the raw tool call key (e.g., "readToolCall", "shellToolCall")
+    pub fn get_tool_call_key(&self) -> Option<&str> {
+        if let Some(tool_call) = &self.tool_call {
+            if let Some(obj) = tool_call.as_object() {
+                return obj.keys().next().map(|s| s.as_str());
+            }
+        }
+        None
+    }
+
     /// Get arguments from either `arguments` field or nested in `tool_call`
     pub fn get_arguments(&self) -> Option<&serde_json::Value> {
         if self.arguments.is_some() {
@@ -126,18 +136,99 @@ impl ToolCallEvent {
         None
     }
 
+    /// Get the result from a completed tool call
+    pub fn get_result_data(&self) -> Option<&serde_json::Value> {
+        if let Some(tool_call) = &self.tool_call {
+            if let Some(obj) = tool_call.as_object() {
+                if let Some(inner) = obj.values().next() {
+                    return inner.get("result");
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract file path from tool call arguments based on tool type
+    pub fn get_file_path(&self) -> Option<String> {
+        let args = self.get_arguments()?;
+
+        // Most file tools use "path" directly
+        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+            return Some(path.to_string());
+        }
+
+        // Some tools may use different field names
+        if let Some(path) = args.get("file").and_then(|v| v.as_str()) {
+            return Some(path.to_string());
+        }
+
+        if let Some(path) = args.get("filePath").and_then(|v| v.as_str()) {
+            return Some(path.to_string());
+        }
+
+        // For glob/search tools, try "pattern" or "directory"
+        if let Some(dir) = args.get("directory").and_then(|v| v.as_str()) {
+            return Some(dir.to_string());
+        }
+
+        None
+    }
+
+    /// Extract working directory from tool call arguments (for shell commands)
+    pub fn get_working_directory(&self) -> Option<String> {
+        let args = self.get_arguments()?;
+        args.get("workingDirectory")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Extract line number from tool call arguments if present
+    pub fn get_line_number(&self) -> Option<u32> {
+        let args = self.get_arguments()?;
+
+        // Try common field names for line numbers
+        if let Some(line) = args.get("line").and_then(|v| v.as_u64()) {
+            return Some(line as u32);
+        }
+        if let Some(line) = args.get("lineNumber").and_then(|v| v.as_u64()) {
+            return Some(line as u32);
+        }
+        if let Some(line) = args.get("startLine").and_then(|v| v.as_u64()) {
+            return Some(line as u32);
+        }
+
+        None
+    }
+
     fn normalize_tool_name(key: &str) -> &'static str {
         match key {
+            // File operations
             "readToolCall" => "readFile",
             "writeToolCall" => "writeFile",
             "editToolCall" => "edit",
+            "deleteToolCall" => "delete",
+            // Directory operations
             "lsToolCall" => "ls",
+            "listToolCall" => "ls",
+            // Search operations
             "searchToolCall" => "search",
             "grepToolCall" => "grep",
             "globToolCall" => "glob",
-            "bashToolCall" => "bash",
+            "findToolCall" => "find",
+            // Shell/command execution
+            "bashToolCall" => "shell",
+            "shellToolCall" => "shell",
+            "terminalToolCall" => "shell",
+            "executeToolCall" => "execute",
+            // Network operations
             "fetchToolCall" => "fetch",
-            _ => "unknown",
+            "httpToolCall" => "fetch",
+            "curlToolCall" => "fetch",
+            // Other
+            "thinkToolCall" => "think",
+            "function" => "function",
+            // Unknown tools - log for discovery but return generic name
+            _ => "tool",
         }
     }
 }
