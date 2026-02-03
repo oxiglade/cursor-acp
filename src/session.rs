@@ -27,6 +27,7 @@ pub struct Session {
     #[allow(dead_code)]
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     model: RefCell<Option<String>>,
+    mode: RefCell<Option<String>>,
     active_process: TokioMutex<Option<CursorProcess>>,
 }
 
@@ -41,6 +42,7 @@ impl Session {
             cwd,
             client_capabilities,
             model: RefCell::new(None),
+            mode: RefCell::new(None),
             active_process: TokioMutex::new(None),
         }
     }
@@ -49,9 +51,12 @@ impl Session {
         *self.model.borrow_mut() = Some(model);
     }
 
+    pub fn set_mode(&self, mode: String) {
+        *self.mode.borrow_mut() = Some(mode);
+    }
+
     /// Process a prompt request by spawning Cursor CLI
     pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
-        // Extract text content from the prompt
         let prompt_text = request
             .prompt
             .iter()
@@ -77,15 +82,20 @@ impl Session {
         info!("Processing prompt: {}", truncate(&prompt_text, 100));
 
         let model = self.model.borrow().clone();
+        let mode = self.mode.borrow().clone();
 
-        let mut process =
-            CursorProcess::spawn(&prompt_text, Some(self.cwd.as_path()), model.as_deref())
-                .await
-                .map_err(|e| {
-                    error!("Failed to spawn Cursor CLI: {e}");
-                    self.send_error(&format!("Failed to start Cursor CLI: {e}"));
-                    Error::internal_error().data(e.to_string())
-                })?;
+        let mut process = CursorProcess::spawn(
+            &prompt_text,
+            Some(self.cwd.as_path()),
+            model.as_deref(),
+            mode.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to spawn Cursor CLI: {e}");
+            self.send_error(&format!("Failed to start Cursor CLI: {e}"));
+            Error::internal_error().data(e.to_string())
+        })?;
 
         let result = self.process_events(&mut process).await;
         drop(process.wait().await);
@@ -187,7 +197,6 @@ impl Session {
                     }
                 }
                 StreamEvent::Assistant(msg) => {
-                    // Send assistant message chunks
                     for part in &msg.message.content {
                         if let crate::stream_json::ContentPart::Text { text } = part {
                             // Check for authentication required message
@@ -206,50 +215,46 @@ impl Session {
                         }
                     }
                 }
-                StreamEvent::ToolCall(tc) => {
-                    match tc.subtype {
-                        ToolCallSubtype::Started => {
-                            let tool_name = tc.tool_name.as_deref().unwrap_or("unknown");
-                            debug!("Tool call started: {} - {}", tc.call_id, tool_name);
+                StreamEvent::ToolCall(tc) => match tc.subtype {
+                    ToolCallSubtype::Started => {
+                        let tool_name = tc.tool_name.as_deref().unwrap_or("unknown");
+                        debug!("Tool call started: {} - {}", tc.call_id, tool_name);
 
-                            // Send tool call notification
-                            let mut tool_call = ToolCall::new(
-                                ToolCallId::new(tc.call_id.clone()),
-                                format_tool_title(tool_name, &tc.arguments),
-                            )
-                            .kind(map_tool_kind(tool_name))
-                            .status(ToolCallStatus::InProgress);
+                        let mut tool_call = ToolCall::new(
+                            ToolCallId::new(tc.call_id.clone()),
+                            format_tool_title(tool_name, &tc.arguments),
+                        )
+                        .kind(map_tool_kind(tool_name))
+                        .status(ToolCallStatus::InProgress);
 
-                            if let Some(args) = &tc.arguments {
-                                tool_call = tool_call.raw_input(args.clone());
-                            }
-                            self.send_tool_call(tool_call).await;
+                        if let Some(args) = &tc.arguments {
+                            tool_call = tool_call.raw_input(args.clone());
                         }
-                        ToolCallSubtype::Completed => {
-                            debug!("Tool call completed: {}", tc.call_id);
-
-                            // Send tool call completion
-                            let mut fields =
-                                ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
-
-                            if let Some(result) = &tc.result {
-                                if let Some(output) = &result.output {
-                                    fields = fields
-                                        .raw_output(serde_json::Value::String(output.clone()));
-                                }
-                                if let Some(error) = &result.error {
-                                    fields = fields.raw_output(serde_json::json!({"error": error}));
-                                }
-                            }
-
-                            self.send_tool_call_update(ToolCallUpdate::new(
-                                ToolCallId::new(tc.call_id.clone()),
-                                fields,
-                            ))
-                            .await;
-                        }
+                        self.send_tool_call(tool_call).await;
                     }
-                }
+                    ToolCallSubtype::Completed => {
+                        debug!("Tool call completed: {}", tc.call_id);
+
+                        let mut fields =
+                            ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+
+                        if let Some(result) = &tc.result {
+                            if let Some(output) = &result.output {
+                                fields =
+                                    fields.raw_output(serde_json::Value::String(output.clone()));
+                            }
+                            if let Some(error) = &result.error {
+                                fields = fields.raw_output(serde_json::json!({"error": error}));
+                            }
+                        }
+
+                        self.send_tool_call_update(ToolCallUpdate::new(
+                            ToolCallId::new(tc.call_id.clone()),
+                            fields,
+                        ))
+                        .await;
+                    }
+                },
                 StreamEvent::Result(res) => {
                     if res.is_error {
                         if let Some(error) = &res.error {

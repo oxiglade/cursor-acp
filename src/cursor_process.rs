@@ -65,6 +65,7 @@ impl CursorProcess {
         prompt: &str,
         working_dir: Option<&std::path::Path>,
         model: Option<&str>,
+        mode: Option<&str>,
     ) -> Result<Self> {
         let cursor_bin = find_cursor_binary()?;
 
@@ -75,6 +76,10 @@ impl CursorProcess {
 
         if let Some(model) = model {
             cmd.arg("--model").arg(model);
+        }
+
+        if let Some(mode) = mode {
+            cmd.arg("--mode").arg(mode);
         }
 
         // Prompt comes last

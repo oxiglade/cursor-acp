@@ -13,11 +13,11 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client, ClientCapabilities,
     Error, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelInfo, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse,
+    SessionId, SessionMode, SessionModeState, SessionModelState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use tracing::{debug, info};
 
@@ -214,7 +214,6 @@ impl Agent for CursorAgent {
             CursorAuthMethod::BrowserLogin => {
                 info!("Starting browser login flow");
 
-                // Launch the login command
                 let binary_path = find_cursor_binary().map_err(|e| {
                     Error::internal_error().data(format!("Cursor CLI not found: {e}"))
                 })?;
@@ -286,10 +285,34 @@ impl Agent for CursorAgent {
 
         debug!("Created new session: {}", session_id.0);
 
-        // Send available commands to the client
         self.send_available_commands(session_id.clone());
 
-        Ok(NewSessionResponse::new(session_id))
+        let modes = SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default")
+                    .description("Normal mode with full tool access"),
+                SessionMode::new("plan", "Plan").description("Read-only planning mode"),
+                SessionMode::new("ask", "Ask").description("Q&A mode for explanations"),
+            ],
+        );
+
+        let models = SessionModelState::new(
+            "auto",
+            vec![
+                ModelInfo::new("auto", "Auto"),
+                ModelInfo::new("opus-4.5-thinking", "Claude 4.5 Opus (Thinking)"),
+                ModelInfo::new("opus-4.5", "Claude 4.5 Opus"),
+                ModelInfo::new("sonnet-4.5-thinking", "Claude 4.5 Sonnet (Thinking)"),
+                ModelInfo::new("sonnet-4.5", "Claude 4.5 Sonnet"),
+                ModelInfo::new("gpt-5.2", "GPT-5.2"),
+                ModelInfo::new("gemini-3-pro", "Gemini 3 Pro"),
+            ],
+        );
+
+        Ok(NewSessionResponse::new(session_id)
+            .modes(modes)
+            .models(models))
     }
 
     async fn load_session(
@@ -340,7 +363,20 @@ impl Agent for CursorAgent {
             "Setting session mode for session: {} to {:?}",
             request.session_id, request.mode_id
         );
-        // Cursor doesn't have explicit modes in CLI
+
+        if let Ok(session) = self.get_session(&request.session_id) {
+            // Map ACP mode IDs to Cursor CLI modes
+            let cursor_mode = match request.mode_id.0.as_ref() {
+                "plan" => Some("plan"),
+                "ask" => Some("ask"),
+                "default" | "normal" => None, // No --mode flag for default
+                _ => None,
+            };
+            if let Some(mode) = cursor_mode {
+                session.set_mode(mode.to_string());
+            }
+        }
+
         Ok(SetSessionModeResponse::default())
     }
 
