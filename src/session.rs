@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::cursor_process::find_cursor_binary;
 use agent_client_protocol::{
-    Client, ClientCapabilities, ContentBlock, ContentChunk, Error, PromptRequest, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
+    Client, ClientCapabilities, ContentBlock, ContentChunk, Error, ImageContent, PromptRequest,
+    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
     ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use tokio::sync::oneshot;
@@ -25,6 +25,28 @@ use crate::cursor_process::{CursorProcess, CursorProcessParts};
 use crate::stream_json::{StreamEvent, ToolCallSubtype};
 use crate::ACP_CLIENT;
 use tokio::sync::mpsc;
+
+/// Build a single prompt string from ACP content blocks, preserving order.
+/// Text blocks are concatenated; image blocks are embedded as markdown data URLs.
+fn content_blocks_to_prompt(blocks: &[ContentBlock]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(TextContent { text, .. }) => {
+                if !text.is_empty() {
+                    parts.push(text.clone());
+                }
+            }
+            ContentBlock::Image(ImageContent {
+                data, mime_type, ..
+            }) => {
+                parts.push(format!("![image](data:{};base64,{})", mime_type, data));
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
 
 /// Messages that can be sent to the session's background task
 enum SessionMessage {
@@ -98,15 +120,7 @@ impl Session {
     /// Process a prompt request by sending it to the background worker.
     /// Blocks until processing completes, streaming progress via session notifications.
     pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
-        let prompt_text = request
-            .prompt
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(TextContent { text, .. }) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let prompt_text = content_blocks_to_prompt(&request.prompt);
 
         if prompt_text.is_empty() {
             return Ok(StopReason::EndTurn);
