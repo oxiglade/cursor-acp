@@ -22,7 +22,9 @@ use agent_client_protocol::{
 };
 use tracing::{debug, info};
 
-use crate::cursor_process::find_cursor_binary;
+use crate::cursor_process::{
+    check_cursor_cli_available, create_cursor_chat, find_cursor_binary, list_cursor_models,
+};
 use crate::session::Session;
 use crate::session_storage::{generate_title, SessionMetadata, SessionStorage};
 use crate::ACP_CLIENT;
@@ -57,6 +59,19 @@ impl TryFrom<AuthMethodId> for CursorAuthMethod {
     }
 }
 
+/// Default model list when CLI models cannot be loaded
+fn default_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo::new("auto", "Auto"),
+        ModelInfo::new("opus-4.5-thinking", "Claude 4.5 Opus (Thinking)"),
+        ModelInfo::new("opus-4.5", "Claude 4.5 Opus"),
+        ModelInfo::new("sonnet-4.5-thinking", "Claude 4.5 Sonnet (Thinking)"),
+        ModelInfo::new("sonnet-4.5", "Claude 4.5 Sonnet"),
+        ModelInfo::new("gpt-5.2", "GPT-5.2"),
+        ModelInfo::new("gemini-3-pro", "Gemini 3 Pro"),
+    ]
+}
+
 /// The Cursor ACP agent
 pub struct CursorAgent {
     /// Capabilities of the connected client
@@ -71,6 +86,8 @@ pub struct CursorAgent {
     authenticated: RefCell<bool>,
     /// Persistent session storage for history
     session_storage: RefCell<SessionStorage>,
+    /// Available models (from CLI or default)
+    models: RefCell<Vec<ModelInfo>>,
 }
 
 impl CursorAgent {
@@ -111,7 +128,13 @@ impl CursorAgent {
             next_session_id: RefCell::new(max_existing_id + 1),
             authenticated: RefCell::new(authenticated),
             session_storage: RefCell::new(session_storage),
+            models: RefCell::new(default_models()),
         }
+    }
+
+    /// Return the current list of available models (from CLI or default)
+    fn get_models(&self) -> Vec<ModelInfo> {
+        self.models.borrow().clone()
     }
 
     fn get_session(&self, session_id: &SessionId) -> Result<Rc<Session>, Error> {
@@ -128,8 +151,8 @@ impl CursorAgent {
         SessionId::new(format!("cursor-session-{id}"))
     }
 
-    /// Build auth methods based on client capabilities
-    fn build_auth_methods(&self) -> Vec<AuthMethod> {
+    /// Build auth methods based on client capabilities. Only add terminal-auth when CLI is available.
+    fn build_auth_methods(&self, cli_available: bool) -> Vec<AuthMethod> {
         let caps = self.client_capabilities.lock().unwrap();
 
         // Check if client supports terminal-auth capability
@@ -145,8 +168,8 @@ impl CursorAgent {
         let mut login_method = AuthMethod::new(CursorAuthMethod::BrowserLogin, "Login with Cursor")
             .description("Opens a browser to authenticate with your Cursor account");
 
-        // If client supports terminal-auth, add metadata for launching the login command
-        if supports_terminal_auth {
+        // If client supports terminal-auth and CLI is available, add metadata for launching the login command
+        if supports_terminal_auth && cli_available {
             if let Ok(cli_path) = find_cursor_binary() {
                 let mut meta = serde_json::Map::new();
                 meta.insert(
@@ -220,6 +243,23 @@ impl Agent for CursorAgent {
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
+        // Check CLI availability; init does not fail if unavailable
+        let cli_available = check_cursor_cli_available().await;
+        if !cli_available {
+            info!("Cursor CLI not available; init continues with reduced capabilities.");
+        } else if let Ok(pairs) = list_cursor_models().await {
+            let models: Vec<ModelInfo> = pairs
+                .into_iter()
+                .map(|(id, name)| ModelInfo::new(id, name))
+                .collect();
+            if !models.is_empty() {
+                *self.models.borrow_mut() = models;
+                debug!("Loaded model list from Cursor CLI");
+            }
+        } else {
+            debug!("Using default model list (cursor-agent models failed or unavailable)");
+        }
+
         let session_capabilities = SessionCapabilities::new().list(SessionListCapabilities::new());
 
         let mut agent_capabilities = AgentCapabilities::new()
@@ -232,14 +272,21 @@ impl Agent for CursorAgent {
             serde_json::to_string(&agent_capabilities)
         );
 
-        let auth_methods = self.build_auth_methods();
+        let auth_methods = self.build_auth_methods(cli_available);
+
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "cursorCliAvailable".to_string(),
+            serde_json::Value::Bool(cli_available),
+        );
 
         Ok(InitializeResponse::new(ProtocolVersion::V1)
             .agent_capabilities(agent_capabilities)
             .agent_info(
                 Implementation::new("cursor-acp", env!("CARGO_PKG_VERSION")).title("Cursor"),
             )
-            .auth_methods(auth_methods))
+            .auth_methods(auth_methods)
+            .meta(meta))
     }
 
     async fn authenticate(
@@ -272,7 +319,7 @@ impl Agent for CursorAgent {
                     }
                     Ok(status) => {
                         info!("Login process exited with status: {}", status);
-                        // Still mark as authenticated - user may have completed login
+                        // Mark as authenticated after login attempt
                         *self.authenticated.borrow_mut() = true;
                     }
                     Err(e) => {
@@ -297,10 +344,10 @@ impl Agent for CursorAgent {
     }
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        // Don't require auth upfront - Cursor CLI will prompt if needed
-        // and we'll get an error we can surface
-
         let NewSessionRequest { cwd, .. } = request;
+        if !cwd.is_absolute() {
+            return Err(Error::invalid_params().data("cwd must be an absolute path"));
+        }
         info!("Creating new session with cwd: {}", cwd.display());
 
         let session_id = self.next_session_id();
@@ -311,6 +358,7 @@ impl Agent for CursorAgent {
             .unwrap()
             .insert(session_id.clone(), cwd.clone());
 
+        let available_models = self.get_models();
         let (selected_mode, selected_model) = {
             let storage = self.session_storage.borrow();
             let mode = match storage.last_mode.as_deref() {
@@ -318,15 +366,17 @@ impl Agent for CursorAgent {
                 Some("ask") => "ask",
                 _ => "default",
             };
-            let model = match storage.last_model.as_deref() {
-                Some("opus-4.5-thinking") => "opus-4.5-thinking",
-                Some("opus-4.5") => "opus-4.5",
-                Some("sonnet-4.5-thinking") => "sonnet-4.5-thinking",
-                Some("sonnet-4.5") => "sonnet-4.5",
-                Some("gpt-5.2") => "gpt-5.2",
-                Some("gemini-3-pro") => "gemini-3-pro",
-                _ => "auto",
-            };
+            let preferred_model = storage.last_model.clone();
+            drop(storage);
+            let model = preferred_model
+                .as_deref()
+                .filter(|m| {
+                    available_models
+                        .iter()
+                        .any(|mi| mi.model_id.0.as_ref() == *m)
+                })
+                .unwrap_or("auto")
+                .to_string();
             (mode, model)
         };
 
@@ -337,7 +387,7 @@ impl Agent for CursorAgent {
         ));
 
         if selected_model != "auto" {
-            session.set_model(selected_model.to_string());
+            session.set_model(selected_model.clone());
         }
         if selected_mode != "default" {
             session.set_mode(selected_mode.to_string());
@@ -350,6 +400,20 @@ impl Agent for CursorAgent {
         // Persist session metadata
         let metadata = SessionMetadata::new(session_id.clone(), cwd);
         self.session_storage.borrow_mut().upsert(metadata);
+
+        // Create a Cursor chat and set its ID on the session (used as --resume when spawning)
+        let session_id_str = session_id.0.to_string();
+        if let Ok(chat_id) = create_cursor_chat().await {
+            if let Some(s) = self.sessions.borrow().get(&session_id) {
+                s.set_cursor_session_id(chat_id.clone());
+            }
+            self.session_storage
+                .borrow_mut()
+                .set_cursor_session_id(&session_id_str, chat_id.clone());
+            debug!("Created Cursor chat for session: {}", session_id.0);
+        } else {
+            tracing::warn!("create-chat failed; continuing without resume ID");
+        }
 
         debug!("Created new session: {}", session_id.0);
 
@@ -365,18 +429,7 @@ impl Agent for CursorAgent {
             ],
         );
 
-        let models = SessionModelState::new(
-            selected_model,
-            vec![
-                ModelInfo::new("auto", "Auto"),
-                ModelInfo::new("opus-4.5-thinking", "Claude 4.5 Opus (Thinking)"),
-                ModelInfo::new("opus-4.5", "Claude 4.5 Opus"),
-                ModelInfo::new("sonnet-4.5-thinking", "Claude 4.5 Sonnet (Thinking)"),
-                ModelInfo::new("sonnet-4.5", "Claude 4.5 Sonnet"),
-                ModelInfo::new("gpt-5.2", "GPT-5.2"),
-                ModelInfo::new("gemini-3-pro", "Gemini 3 Pro"),
-            ],
-        );
+        let models = SessionModelState::new(selected_model, available_models);
 
         Ok(NewSessionResponse::new(session_id)
             .modes(modes)
@@ -408,7 +461,7 @@ impl Agent for CursorAgent {
             self.client_capabilities.clone(),
         ));
 
-        // Restore Cursor CLI session ID for conversation continuity
+        // Restore Cursor CLI session ID on the session
         if let Some(cursor_sid) = &metadata.cursor_session_id {
             session.set_cursor_session_id(cursor_sid.clone());
             debug!("Restored Cursor session ID: {}", cursor_sid);
@@ -441,6 +494,7 @@ impl Agent for CursorAgent {
 
         self.send_available_commands(request.session_id.clone());
 
+        let available_models = self.get_models();
         let (selected_mode, selected_model) = {
             let storage = self.session_storage.borrow();
             let mode = match storage.last_mode.as_deref() {
@@ -448,15 +502,17 @@ impl Agent for CursorAgent {
                 Some("ask") => "ask",
                 _ => "default",
             };
-            let model = match storage.last_model.as_deref() {
-                Some("opus-4.5-thinking") => "opus-4.5-thinking",
-                Some("opus-4.5") => "opus-4.5",
-                Some("sonnet-4.5-thinking") => "sonnet-4.5-thinking",
-                Some("sonnet-4.5") => "sonnet-4.5",
-                Some("gpt-5.2") => "gpt-5.2",
-                Some("gemini-3-pro") => "gemini-3-pro",
-                _ => "auto",
-            };
+            let preferred_model = storage.last_model.clone();
+            drop(storage);
+            let model = preferred_model
+                .as_deref()
+                .filter(|m| {
+                    available_models
+                        .iter()
+                        .any(|mi| mi.model_id.0.as_ref() == *m)
+                })
+                .unwrap_or("auto")
+                .to_string();
             (mode, model)
         };
 
@@ -470,18 +526,7 @@ impl Agent for CursorAgent {
             ],
         );
 
-        let models = SessionModelState::new(
-            selected_model,
-            vec![
-                ModelInfo::new("auto", "Auto"),
-                ModelInfo::new("opus-4.5-thinking", "Claude 4.5 Opus (Thinking)"),
-                ModelInfo::new("opus-4.5", "Claude 4.5 Opus"),
-                ModelInfo::new("sonnet-4.5-thinking", "Claude 4.5 Sonnet (Thinking)"),
-                ModelInfo::new("sonnet-4.5", "Claude 4.5 Sonnet"),
-                ModelInfo::new("gpt-5.2", "GPT-5.2"),
-                ModelInfo::new("gemini-3-pro", "Gemini 3 Pro"),
-            ],
-        );
+        let models = SessionModelState::new(selected_model, available_models);
 
         Ok(LoadSessionResponse::new().modes(modes).models(models))
     }
@@ -632,7 +677,28 @@ impl Agent for CursorAgent {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    #[tokio::test]
+    async fn test_new_session_rejects_relative_cwd() {
+        let agent = CursorAgent::new();
+        let request = NewSessionRequest::new(PathBuf::from("./relative/path"));
+        let result = agent.new_session(request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let detail = err
+            .data
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or(&err.message);
+        assert!(
+            detail.contains("absolute path"),
+            "error detail should mention absolute path: {:?}",
+            err
+        );
+    }
 
     #[test]
     fn test_agent_capabilities_serialization() {

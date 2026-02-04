@@ -13,6 +13,110 @@ use tokio::sync::mpsc;
 
 use crate::stream_json::StreamEvent;
 
+/// Run a Cursor CLI command with the given args (e.g. `["--version"]`, `["models"]`, `["create-chat"]`).
+/// Returns (success, stdout, stderr). Fails if the binary cannot be found or the process fails to start.
+pub async fn run_cursor_command(args: &[&str]) -> Result<(bool, String, String)> {
+    let cursor_bin = find_cursor_binary()?;
+    let output = Command::new(&cursor_bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to run Cursor CLI")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok((output.status.success(), stdout, stderr))
+}
+
+/// Returns true if the Cursor CLI is available (binary found and `--version` succeeds).
+/// Does not fail; returns false on any error.
+pub async fn check_cursor_cli_available() -> bool {
+    if find_cursor_binary().is_err() {
+        return false;
+    }
+    run_cursor_command(&["--version"])
+        .await
+        .map(|(ok, _, _)| ok)
+        .unwrap_or(false)
+}
+
+/// Create a new Cursor chat and return its ID. Pass to spawn as `--resume <id>`.
+pub async fn create_cursor_chat() -> Result<String> {
+    let (ok, stdout, stderr) = run_cursor_command(&["create-chat"]).await?;
+    let id = stdout.trim().to_string();
+    if !ok {
+        anyhow::bail!("cursor-agent create-chat failed: {}", stderr.trim());
+    }
+    if id.is_empty() {
+        anyhow::bail!("cursor-agent create-chat returned empty ID");
+    }
+    Ok(id)
+}
+
+/// Parse the output of `cursor-agent models` into (model_id, display_name) pairs.
+/// Expects lines like "model-id - Display Name" or "model-id - Display Name  (current)" after an "Available models" header.
+pub fn parse_models_output(stdout: &str) -> Vec<(String, String)> {
+    let mut models = Vec::new();
+    let mut in_models_section = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.to_lowercase().contains("available models") {
+            in_models_section = true;
+            continue;
+        }
+        if trimmed.to_lowercase().starts_with("tip:") {
+            continue;
+        }
+        if in_models_section {
+            let dash = " - ";
+            if let Some(pos) = trimmed.find(dash) {
+                let id = trimmed[..pos].trim().to_string();
+                let mut name = trimmed[pos + dash.len()..].to_string();
+                // Remove "(current)" or "(default)" suffix
+                if let Some(open) = name.find('(') {
+                    name = name[..open].trim().to_string();
+                }
+                let name = name.trim().to_string();
+                if !id.is_empty() && !name.is_empty() {
+                    // Avoid duplicate "auto"
+                    if id == "auto" && models.iter().any(|(i, _)| i == "auto") {
+                        continue;
+                    }
+                    models.push((id, name));
+                }
+            }
+        }
+    }
+    // Ensure "auto" is first if present
+    if let Some(pos) = models.iter().position(|(id, _)| id == "auto") {
+        if pos > 0 {
+            let auto = models.remove(pos);
+            models.insert(0, auto);
+        }
+    } else if !models.is_empty() {
+        models.insert(0, ("auto".to_string(), "Auto".to_string()));
+    }
+    models
+}
+
+/// Load the list of models from the Cursor CLI. On failure returns an error; caller can fall back to a default list.
+pub async fn list_cursor_models() -> Result<Vec<(String, String)>> {
+    let (ok, stdout, _) = run_cursor_command(&["models"]).await?;
+    if !ok {
+        anyhow::bail!("cursor-agent models failed");
+    }
+    let models = parse_models_output(&stdout);
+    if models.is_empty() {
+        anyhow::bail!("cursor-agent models produced no models");
+    }
+    Ok(models)
+}
+
 /// Finds the Cursor CLI binary
 pub fn find_cursor_binary() -> Result<PathBuf> {
     // The CLI is called "agent" or "cursor-agent"
@@ -92,7 +196,7 @@ impl CursorProcess {
             cmd.arg("--mode").arg(mode);
         }
 
-        // Resume previous session for conversation continuity
+        // Pass --resume with session ID when resuming
         if let Some(session_id) = resume_session_id {
             cmd.arg("--resume").arg(session_id);
             tracing::info!("Resuming Cursor session: {}", session_id);
@@ -214,5 +318,50 @@ impl Drop for CursorProcess {
         if let Some(ref mut child) = self.child {
             drop(child.start_kill());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_models_output;
+
+    #[test]
+    fn test_parse_models_output() {
+        let output = r#"
+Available models
+
+auto - Auto  (current)
+composer-1 - Composer 1
+opus-4.5 - Claude 4.5 Opus
+"#;
+        let models = parse_models_output(output);
+        assert!(!models.is_empty());
+        assert_eq!(models[0], ("auto".to_string(), "Auto".to_string()));
+        assert!(models.iter().any(|(id, _)| id == "composer-1"));
+        assert!(models.iter().any(|(id, _)| id == "opus-4.5"));
+    }
+
+    #[test]
+    fn test_parse_models_output_empty_after_header() {
+        let output = "Available models\n\n";
+        let models = parse_models_output(output);
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_parse_models_output_strips_default_suffix() {
+        let output = "Available models\n\nsonnet-4.5 - Claude 4.5 Sonnet  (default)\n";
+        let models = parse_models_output(output);
+        assert!(models
+            .iter()
+            .any(|(id, name)| id == "sonnet-4.5" && name == "Claude 4.5 Sonnet"));
+    }
+
+    #[test]
+    fn test_parse_models_output_skips_tip_lines() {
+        let output = "Available models\n\ntip: run cursor-agent models\nauto - Auto\n";
+        let models = parse_models_output(output);
+        assert!(models.iter().any(|(id, _)| id == "auto"));
+        assert!(!models.iter().any(|(id, _)| id == "tip:"));
     }
 }
