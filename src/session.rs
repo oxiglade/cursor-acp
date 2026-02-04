@@ -45,6 +45,8 @@ enum SessionMessage {
 pub struct Session {
     /// Channel to send messages to the background task
     message_tx: mpsc::Sender<SessionMessage>,
+    /// Notify the worker to cancel the current prompt (so it can react while blocked in process_events)
+    cancel_tx: mpsc::Sender<()>,
     /// Cursor CLI's internal session ID for conversation continuity (shared with background task)
     cursor_session_id: Arc<Mutex<Option<String>>>,
 }
@@ -56,19 +58,22 @@ impl Session {
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::channel(32);
+        let (cancel_tx, cancel_rx) = mpsc::channel(4);
         let cursor_session_id = Arc::new(Mutex::new(None));
 
-        // Spawn the background task that processes messages
+        // Spawn the background task that processes messages (cancel_rx passed in so worker
+        // can react to cancel while blocked in process_events without double-borrow)
         let worker = SessionWorker::new(
             session_id.clone(),
             cwd,
             client_capabilities,
             cursor_session_id.clone(),
         );
-        tokio::task::spawn_local(worker.run(message_rx));
+        tokio::task::spawn_local(worker.run(message_rx, cancel_rx));
 
         Self {
             message_tx,
+            cancel_tx,
             cursor_session_id,
         }
     }
@@ -127,8 +132,12 @@ impl Session {
             .map_err(|_| Error::internal_error().data("Session worker dropped response channel"))?
     }
 
-    /// Cancel the current operation
+    /// Cancel the current operation.
+    /// Notifies the worker via cancel_tx so it can kill the child even while blocked in process_events;
+    /// also sends a Cancel message so the worker acknowledges and the client can await.
     pub async fn cancel(&self) {
+        // Notify worker immediately so it can react inside process_events (ignore if full/closed)
+        let _ = self.cancel_tx.try_send(());
         let (response_tx, response_rx) = oneshot::channel();
         if self
             .message_tx
@@ -174,8 +183,13 @@ impl SessionWorker {
         }
     }
 
-    /// Main loop that processes messages from the channel
-    async fn run(mut self, mut message_rx: mpsc::Receiver<SessionMessage>) {
+    /// Main loop that processes messages from the channel.
+    /// `cancel_rx` is passed in (not stored) so we can pass it to process_events without overlapping borrows.
+    async fn run(
+        mut self,
+        mut message_rx: mpsc::Receiver<SessionMessage>,
+        mut cancel_rx: mpsc::Receiver<()>,
+    ) {
         info!("Session worker started for {}", self.session_id.0);
 
         while let Some(msg) = message_rx.recv().await {
@@ -184,7 +198,7 @@ impl SessionWorker {
                     prompt_text,
                     response_tx,
                 } => {
-                    let result = self.handle_prompt(prompt_text).await;
+                    let result = self.handle_prompt(prompt_text, &mut cancel_rx).await;
                     if let Err(ref e) = result {
                         self.send_agent_text(&format!("\n\nError: {}\n", e.message))
                             .await;
@@ -208,7 +222,11 @@ impl SessionWorker {
     }
 
     /// Handle a prompt message
-    async fn handle_prompt(&mut self, prompt_text: String) -> Result<StopReason, Error> {
+    async fn handle_prompt(
+        &mut self,
+        prompt_text: String,
+        cancel_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<StopReason, Error> {
         info!("Received prompt text: {:?}", prompt_text);
 
         // Handle /login command
@@ -245,7 +263,7 @@ impl SessionWorker {
         let CursorProcessParts { child, event_rx } = process.into_parts();
         self.active_child = Some(child);
 
-        let result = self.process_events(event_rx).await;
+        let result = self.process_events(event_rx, cancel_rx).await;
 
         if let Some(mut child) = self.active_child.take() {
             drop(child.wait().await);
@@ -351,16 +369,23 @@ impl SessionWorker {
         }
     }
 
-    /// Process events from Cursor CLI
+    /// Process events from Cursor CLI.
+    /// Uses select! so we can react to cancel requests even while waiting for the next event.
     async fn process_events(
         &mut self,
         mut event_rx: mpsc::Receiver<StreamEvent>,
+        cancel_rx: &mut mpsc::Receiver<()>,
     ) -> Result<StopReason, Error> {
-        while let Some(event) = event_rx.recv().await {
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Ok(StopReason::Cancelled);
-            }
-            match event {
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    if self.cancelled.load(Ordering::SeqCst) {
+                        return Ok(StopReason::Cancelled);
+                    }
+                    match event {
                 StreamEvent::System(sys) => {
                     debug!("Cursor system event: subtype={}", sys.subtype);
                     self.capture_cursor_session_id_if_present(sys.session_id.as_ref());
@@ -480,6 +505,18 @@ impl SessionWorker {
                 }
                 StreamEvent::User(_) => {
                     // User messages are echoed back, ignore
+                }
+            }
+                }
+                cancel_msg = cancel_rx.recv() => {
+                    if cancel_msg.is_some() {
+                        info!("Cancel requested via channel, killing Cursor CLI process");
+                        self.cancelled.store(true, Ordering::SeqCst);
+                        if let Some(mut child) = self.active_child.take() {
+                            drop(child.kill().await);
+                        }
+                        return Ok(StopReason::Cancelled);
+                    }
                 }
             }
         }
