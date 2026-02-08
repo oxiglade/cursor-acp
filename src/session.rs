@@ -10,7 +10,8 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::cursor_process::find_cursor_binary;
 use agent_client_protocol::{
@@ -117,8 +118,7 @@ impl Session {
         self.cursor_session_id.lock().unwrap().clone()
     }
 
-    /// Process a prompt request by sending it to the background worker.
-    /// Blocks until processing completes, streaming progress via session notifications.
+    /// Send a prompt to the background worker and await the result.
     pub async fn prompt(&self, request: PromptRequest) -> Result<StopReason, Error> {
         let prompt_text = content_blocks_to_prompt(&request.prompt);
 
@@ -243,6 +243,10 @@ impl SessionWorker {
     ) -> Result<StopReason, Error> {
         info!("Received prompt text: {:?}", prompt_text);
 
+        // Drain stale cancel signals from a previous prompt.
+        while cancel_rx.try_recv().is_ok() {}
+        self.cancelled.store(false, Ordering::SeqCst);
+
         // Handle /login command
         let trimmed = prompt_text.trim();
         if trimmed == "/login" || trimmed == "login" {
@@ -273,14 +277,23 @@ impl SessionWorker {
             Error::internal_error().data(e.to_string())
         })?;
 
-        self.cancelled.store(false, Ordering::SeqCst);
         let CursorProcessParts { child, event_rx } = process.into_parts();
         self.active_child = Some(child);
 
         let result = self.process_events(event_rx, cancel_rx).await;
 
         if let Some(mut child) = self.active_child.take() {
+            drop(child.kill().await);
             drop(child.wait().await);
+        }
+
+        // Pick up any cancel signal that arrived after process_events finished.
+        if cancel_rx.try_recv().is_ok() {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Ok(StopReason::Cancelled);
         }
 
         result
@@ -355,7 +368,7 @@ impl SessionWorker {
         }
     }
 
-    /// Handle cancel request
+    /// Kill the active CLI process and mark the session as cancelled.
     async fn handle_cancel(&mut self) {
         info!("Cancelling current operation");
         self.cancelled.store(true, Ordering::SeqCst);
@@ -396,9 +409,6 @@ impl SessionWorker {
                     let Some(event) = event else {
                         break;
                     };
-                    if self.cancelled.load(Ordering::SeqCst) {
-                        return Ok(StopReason::Cancelled);
-                    }
                     match event {
                 StreamEvent::System(sys) => {
                     debug!("Cursor system event: subtype={}", sys.subtype);
@@ -524,10 +534,11 @@ impl SessionWorker {
                 }
                 cancel_msg = cancel_rx.recv() => {
                     if cancel_msg.is_some() {
-                        info!("Cancel requested via channel, killing Cursor CLI process");
+                        info!("Cancel requested, killing CLI process");
                         self.cancelled.store(true, Ordering::SeqCst);
                         if let Some(mut child) = self.active_child.take() {
                             drop(child.kill().await);
+                            drop(child.wait().await);
                         }
                         return Ok(StopReason::Cancelled);
                     }
