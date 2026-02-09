@@ -18,13 +18,12 @@ use agent_client_protocol::{
     Client, ClientCapabilities, ContentBlock, ContentChunk, Error, ImageContent, PromptRequest,
     SessionId, SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
     ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    WriteTextFileRequest,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::cursor_process::{CursorProcess, CursorProcessParts};
-use crate::stream_json::{StreamEvent, ToolCallEvent, ToolCallSubtype};
+use crate::stream_json::{StreamEvent, ToolCallSubtype};
 use crate::ACP_CLIENT;
 use tokio::sync::mpsc;
 
@@ -170,6 +169,7 @@ impl Session {
 struct SessionWorker {
     session_id: SessionId,
     cwd: PathBuf,
+    #[allow(dead_code)]
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     model: Option<String>,
     mode: Option<String>,
@@ -498,8 +498,6 @@ impl SessionWorker {
                                 fields,
                             ))
                             .await;
-
-                            self.notify_file_written(&tc).await;
                         }
                     }
                 }
@@ -627,92 +625,9 @@ impl SessionWorker {
             }
         }
     }
-
-    // Notify the client about a file change so it can track it in its action log.
-    async fn notify_file_written(&self, tc: &ToolCallEvent) {
-        if !self.client_supports_write() {
-            return;
-        }
-
-        let Some(tool_key) = tc.get_tool_call_key() else {
-            return;
-        };
-
-        let path = match tool_key {
-            "writeToolCall" | "editToolCall" | "deleteToolCall" => {
-                tc.get_file_path().map(|p| self.resolve_path(&p))
-            }
-            _ => None,
-        };
-
-        let Some(path) = path else {
-            return;
-        };
-
-        // For deletes, send empty content so the client knows the file was removed.
-        // For writes/edits, read the current content from disk (the CLI already wrote it).
-        let content = if tool_key == "deleteToolCall" {
-            String::new()
-        } else {
-            match Self::read_file_for_notification(&path).await {
-                Some(c) => c,
-                None => return,
-            }
-        };
-
-        let Some(client) = ACP_CLIENT.get() else {
-            return;
-        };
-
-        let request = WriteTextFileRequest::new(self.session_id.clone(), &path, content);
-        if let Err(e) = client.write_text_file(request).await {
-            debug!("client.write_text_file failed for {}: {e}", path.display());
-        }
-    }
-
-    //// Read a file for notification, skipping files that are too large or non-text.
-    const MAX_NOTIFY_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
-
-    async fn read_file_for_notification(path: &PathBuf) -> Option<String> {
-        let metadata = match tokio::fs::metadata(path).await {
-            Ok(m) => m,
-            Err(e) => {
-                debug!("Could not stat file {}: {e}", path.display());
-                return None;
-            }
-        };
-
-        if metadata.len() > Self::MAX_NOTIFY_FILE_SIZE {
-            debug!(
-                "Skipping notification for {} ({} bytes exceeds limit)",
-                path.display(),
-                metadata.len()
-            );
-            return None;
-        }
-
-        match tokio::fs::read_to_string(path).await {
-            Ok(c) => Some(c),
-            Err(e) => {
-                debug!("Could not read file {}: {e}", path.display());
-                None
-            }
-        }
-    }
-
-    fn client_supports_write(&self) -> bool {
-        self.client_capabilities.lock().unwrap().fs.write_text_file
-    }
-
-    fn resolve_path(&self, p: &str) -> PathBuf {
-        let path = PathBuf::from(p);
-        if path.is_absolute() {
-            path
-        } else {
-            self.cwd.join(path)
-        }
-    }
 }
+
+use crate::stream_json::ToolCallEvent;
 
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
