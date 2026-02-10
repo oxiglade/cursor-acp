@@ -17,8 +17,9 @@ use std::time::Duration;
 use crate::cursor_process::find_cursor_binary;
 use agent_client_protocol::{
     Client, ClientCapabilities, ContentBlock, ContentChunk, Error, ImageContent, PromptRequest,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    SessionId, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
@@ -355,7 +356,7 @@ impl SessionWorker {
 
         match outcome {
             ProcessEventsOutcome::Cancelled => {
-                // Cancel paths should already terminate the child; this is a safety net.
+                // Ensure cancellation leaves no running child process.
                 drop(child.kill().await);
                 drop(child.wait().await);
                 ProcessEventsOutcome::Cancelled
@@ -515,8 +516,7 @@ impl SessionWorker {
         }
     }
 
-    /// Process events from Cursor CLI.
-    /// Uses select! so we can react to cancel requests even while waiting for the next event.
+    /// Process Cursor CLI events while polling for cancellation.
     async fn process_events(
         &mut self,
         mut event_rx: mpsc::Receiver<StreamEvent>,
@@ -562,6 +562,8 @@ impl SessionWorker {
                     let tool_name = tc.get_tool_name().unwrap_or("unknown");
                     let tool_key = tc.get_tool_call_key();
                     let arguments = tc.get_arguments().cloned();
+                    let terminal_tool = is_terminal_tool_call(tool_name, tool_key, arguments.as_ref());
+                    let terminal_output_supported = self.supports_terminal_output();
 
                     match tc.subtype {
                         ToolCallSubtype::Started => {
@@ -592,15 +594,30 @@ impl SessionWorker {
                                 tool_call = tool_call.locations(locations);
                             }
 
+                            if terminal_tool && terminal_output_supported {
+                                tool_call = tool_call.content(vec![ToolCallContent::Terminal(
+                                    Terminal::new(tc.call_id.clone()),
+                                )]);
+                                tool_call = tool_call.meta(build_terminal_info_meta(
+                                    &tc.call_id,
+                                    tc.get_working_directory().as_deref(),
+                                ));
+                            }
+
                             self.send_tool_call(tool_call).await;
                         }
                         ToolCallSubtype::Completed => {
                             debug!("Tool call completed: {}", tc.call_id);
 
-                            let mut fields =
-                                ToolCallUpdateFields::new().status(ToolCallStatus::Completed);
+                            let result_data = tc.get_result_data();
+                            let status = if tool_call_failed(&tc, result_data) {
+                                ToolCallStatus::Failed
+                            } else {
+                                ToolCallStatus::Completed
+                            };
+                            let mut fields = ToolCallUpdateFields::new().status(status);
 
-                            if let Some(result_data) = tc.get_result_data() {
+                            if let Some(result_data) = result_data {
                                 fields = fields.raw_output(result_data.clone());
                             } else if let Some(result) = &tc.result {
                                 if let Some(output) = &result.output {
@@ -610,13 +627,60 @@ impl SessionWorker {
                                     let val = serde_json::json!({"error": error});
                                     fields = fields.raw_output(val);
                                 }
+                            } else if let Some(tool_call) = &tc.tool_call {
+                                fields = fields.raw_output(tool_call.clone());
                             }
 
-                            self.send_tool_call_update(ToolCallUpdate::new(
-                                ToolCallId::new(tc.call_id.clone()),
-                                fields,
-                            ))
-                            .await;
+                            let mut terminal_output: Option<String> = None;
+                            let mut terminal_exit_code = 0;
+                            if terminal_tool {
+                                terminal_output =
+                                    extract_terminal_output(&tc, result_data).as_deref().map(str::to_owned);
+                                terminal_exit_code = infer_terminal_exit_code(&tc, result_data);
+
+                                if terminal_output.is_none() {
+                                    terminal_output =
+                                        result_data.and_then(pretty_json_for_terminal_fallback);
+                                }
+                                if terminal_output.is_none() {
+                                    terminal_output = tc
+                                        .tool_call
+                                        .as_ref()
+                                        .and_then(pretty_json_for_terminal_fallback);
+                                }
+
+                                if !terminal_output_supported {
+                                    if let Some(output) = terminal_output.as_ref() {
+                                        if !output.is_empty() {
+                                            fields = fields.content(vec![ToolCallContent::from(
+                                                wrap_terminal_output_for_markdown(output),
+                                            )]);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let update =
+                                ToolCallUpdate::new(ToolCallId::new(tc.call_id.clone()), fields);
+
+                            if terminal_tool && terminal_output_supported {
+                                if let Some(output) = terminal_output.as_deref() {
+                                    if !output.is_empty() {
+                                        let output_update = ToolCallUpdate::new(
+                                            ToolCallId::new(tc.call_id.clone()),
+                                            ToolCallUpdateFields::new(),
+                                        )
+                                        .meta(build_terminal_output_meta(&tc.call_id, output));
+                                        self.send_tool_call_update(output_update).await;
+                                    }
+                                }
+
+                                let update =
+                                    update.meta(build_terminal_exit_meta(&tc.call_id, terminal_exit_code));
+                                self.send_tool_call_update(update).await;
+                            } else {
+                                self.send_tool_call_update(update).await;
+                            }
                         }
                     }
                 }
@@ -748,6 +812,21 @@ impl SessionWorker {
             }
         }
     }
+
+    fn supports_terminal_output(&self) -> bool {
+        let caps = self.client_capabilities.lock().unwrap();
+        if let Some(enabled) = caps
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("terminal_output"))
+            .and_then(|value| value.as_bool())
+        {
+            return enabled;
+        }
+
+        // Fallback when terminal_output meta is not advertised.
+        caps.terminal
+    }
 }
 
 use crate::stream_json::ToolCallEvent;
@@ -790,6 +869,363 @@ fn extract_tool_locations(tc: &ToolCallEvent) -> Vec<ToolCallLocation> {
     }
 
     locations
+}
+
+fn is_terminal_tool_call(
+    tool_name: &str,
+    tool_key: Option<&str>,
+    arguments: Option<&serde_json::Value>,
+) -> bool {
+    let normalized_name = tool_name.to_ascii_lowercase();
+    if matches!(
+        normalized_name.as_str(),
+        "shell" | "bash" | "execute" | "run" | "terminal"
+    ) || normalized_name.contains("shell")
+        || normalized_name.contains("bash")
+        || normalized_name.contains("terminal")
+        || normalized_name.contains("execute")
+    {
+        return true;
+    }
+
+    if let Some(tool_key) = tool_key {
+        let normalized_key = tool_key.to_ascii_lowercase();
+        return matches!(
+            normalized_key.as_str(),
+            "shelltoolcall" | "bashtoolcall" | "terminaltoolcall" | "executetoolcall"
+        ) || normalized_key.contains("shell")
+            || normalized_key.contains("bash")
+            || normalized_key.contains("terminal")
+            || normalized_key.contains("execute")
+            || normalized_key.contains("command")
+            || normalized_key.contains("run");
+    }
+
+    if let Some(args) = arguments.and_then(|v| v.as_object()) {
+        for key in [
+            "command",
+            "cmd",
+            "workingDirectory",
+            "cwd",
+            "timeout",
+            "shell",
+            "stdin",
+            "terminalId",
+            "outputByteLimit",
+        ] {
+            if args.contains_key(key) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn tool_call_failed(tc: &ToolCallEvent, result_data: Option<&serde_json::Value>) -> bool {
+    if let Some(result) = &tc.result {
+        if !result.success {
+            return true;
+        }
+        if result.error.as_deref().is_some_and(|e| !e.is_empty()) {
+            return true;
+        }
+    }
+
+    if let Some(result_data) = result_data {
+        if let Some(success) = result_data.get("success").and_then(|v| v.as_bool()) {
+            if !success {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn extract_terminal_output(
+    tc: &ToolCallEvent,
+    result_data: Option<&serde_json::Value>,
+) -> Option<String> {
+    if let Some(result) = &tc.result {
+        if let Some(output) = &result.output {
+            if !output.is_empty() {
+                return Some(output.clone());
+            }
+        }
+        if let Some(error) = &result.error {
+            if !error.is_empty() {
+                return Some(error.clone());
+            }
+        }
+    }
+
+    if let Some(output) = result_data.and_then(extract_terminal_output_from_value) {
+        return Some(output);
+    }
+
+    if let Some(tool_call) = &tc.tool_call {
+        if let Some(output) = extract_terminal_output_from_value(tool_call) {
+            return Some(output);
+        }
+    }
+
+    None
+}
+
+fn infer_terminal_exit_code(tc: &ToolCallEvent, result_data: Option<&serde_json::Value>) -> u32 {
+    if let Some(data) = result_data {
+        if let Some(code) = extract_exit_code_from_value(data) {
+            return code;
+        }
+    }
+
+    if let Some(tool_call) = &tc.tool_call {
+        if let Some(code) = extract_exit_code_from_value(tool_call) {
+            return code;
+        }
+    }
+
+    if let Some(result) = &tc.result {
+        return if result.success { 0 } else { 1 };
+    }
+
+    if tool_call_failed(tc, result_data) {
+        1
+    } else {
+        0
+    }
+}
+
+fn extract_terminal_output_from_value(value: &serde_json::Value) -> Option<String> {
+    let mut chunks = Vec::new();
+    collect_terminal_output_chunks(value, &mut chunks);
+    let mut normalized = Vec::new();
+    for chunk in chunks {
+        if chunk.is_empty() {
+            continue;
+        }
+        if normalized
+            .last()
+            .map(|last: &String| last == &chunk)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        normalized.push(chunk);
+    }
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.join("\n"))
+    }
+}
+
+fn collect_terminal_output_chunks(value: &serde_json::Value, chunks: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => {
+            if !s.is_empty() {
+                chunks.push(s.clone());
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_terminal_output_chunks(value, chunks);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            let mut matched_known_key = false;
+            for key in [
+                "stdout", "stderr", "output", "result", "error", "message", "data", "text",
+                "content", "lines", "line", "chunks", "messages", "value", "response", "body",
+            ] {
+                if let Some(value) = obj.get(key) {
+                    matched_known_key = true;
+                    collect_terminal_output_chunks(value, chunks);
+                }
+            }
+
+            // If no known key matched, recurse all values (minus obvious metadata keys).
+            if !matched_known_key {
+                for (key, value) in obj {
+                    if should_skip_terminal_fallback_key(key) {
+                        continue;
+                    }
+                    collect_terminal_output_chunks(value, chunks);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn should_skip_terminal_fallback_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "command"
+            | "workingdirectory"
+            | "cwd"
+            | "path"
+            | "filepath"
+            | "line"
+            | "linenumber"
+            | "startline"
+            | "toolcallid"
+            | "call_id"
+            | "kind"
+            | "status"
+            | "title"
+            | "name"
+            | "description"
+            | "args"
+            | "arguments"
+    )
+}
+
+fn extract_exit_code_from_value(value: &serde_json::Value) -> Option<u32> {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for key in ["exit_code", "exitCode", "code"] {
+                if let Some(raw) = obj.get(key) {
+                    if let Some(code) = raw.as_u64() {
+                        return Some(code as u32);
+                    }
+                    if let Some(code) = raw.as_i64() {
+                        return Some(code.max(0) as u32);
+                    }
+                }
+            }
+            for key in [
+                "result",
+                "output",
+                "data",
+                "error",
+                "exit_status",
+                "exitStatus",
+                "response",
+                "body",
+            ] {
+                if let Some(nested) = obj.get(key) {
+                    if let Some(code) = extract_exit_code_from_value(nested) {
+                        return Some(code);
+                    }
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(extract_exit_code_from_value),
+        _ => None,
+    }
+}
+
+fn pretty_json_for_terminal_fallback(value: &serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => serde_json::to_string_pretty(value)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "null"),
+    }
+}
+
+fn wrap_terminal_output_for_markdown(output: &str) -> String {
+    let body = output.trim_end_matches('\n');
+
+    // Use a fence longer than any run of backticks in output.
+    let mut longest_backtick_run = 0usize;
+    let mut current_backtick_run = 0usize;
+    for ch in body.chars() {
+        if ch == '`' {
+            current_backtick_run += 1;
+            longest_backtick_run = longest_backtick_run.max(current_backtick_run);
+        } else {
+            current_backtick_run = 0;
+        }
+    }
+
+    let fence = "`".repeat((longest_backtick_run + 1).max(3));
+    format!("{fence}text\n{body}\n{fence}")
+}
+
+fn build_terminal_info_meta(
+    terminal_id: &str,
+    cwd: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut meta = serde_json::Map::new();
+
+    let mut terminal_info = serde_json::Map::new();
+    terminal_info.insert(
+        "terminal_id".to_string(),
+        serde_json::Value::String(terminal_id.to_string()),
+    );
+    if let Some(cwd) = cwd {
+        terminal_info.insert(
+            "cwd".to_string(),
+            serde_json::Value::String(cwd.to_string()),
+        );
+    }
+    meta.insert(
+        "terminal_info".to_string(),
+        serde_json::Value::Object(terminal_info),
+    );
+
+    meta
+}
+
+fn build_terminal_output_meta(
+    terminal_id: &str,
+    output: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut meta = serde_json::Map::new();
+
+    let mut terminal_output = serde_json::Map::new();
+    terminal_output.insert(
+        "terminal_id".to_string(),
+        serde_json::Value::String(terminal_id.to_string()),
+    );
+    terminal_output.insert(
+        "data".to_string(),
+        serde_json::Value::String(output.to_string()),
+    );
+    meta.insert(
+        "terminal_output".to_string(),
+        serde_json::Value::Object(terminal_output),
+    );
+
+    meta
+}
+
+fn build_terminal_exit_meta(
+    terminal_id: &str,
+    exit_code: u32,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut meta = serde_json::Map::new();
+
+    let mut terminal_exit = serde_json::Map::new();
+    terminal_exit.insert(
+        "terminal_id".to_string(),
+        serde_json::Value::String(terminal_id.to_string()),
+    );
+    terminal_exit.insert(
+        "exit_code".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(exit_code)),
+    );
+    terminal_exit.insert("signal".to_string(), serde_json::Value::Null);
+    meta.insert(
+        "terminal_exit".to_string(),
+        serde_json::Value::Object(terminal_exit),
+    );
+
+    meta
 }
 
 fn format_tool_title(
