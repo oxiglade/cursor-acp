@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::cursor_process::find_cursor_binary;
 use agent_client_protocol::{
@@ -178,6 +179,20 @@ struct SessionWorker {
     cursor_session_id: Arc<Mutex<Option<String>>>,
 }
 
+enum ProcessEventsOutcome {
+    Completed,
+    Cancelled,
+    Interrupted(String),
+}
+
+const MAX_INTERRUPTED_RETRIES: usize = 1;
+const CHILD_EXIT_GUARD_TIMEOUT_SECS: u64 = 2;
+const INTERRUPTED_RETRY_PROMPT: &str =
+    "The previous response stream was interrupted. Please continue exactly where you left off, \
+without repeating completed steps.";
+const INTERRUPTED_RETRY_NOTICE: &str =
+    "\n\nConnection interrupted. Attempting automatic resume...\n";
+
 impl SessionWorker {
     fn new(
         session_id: SessionId,
@@ -253,8 +268,48 @@ impl SessionWorker {
             return self.handle_login_command().await;
         }
 
-        info!("Processing prompt: {}", truncate(&prompt_text, 100));
+        let mut attempts = 0usize;
+        let mut attempt_prompt = prompt_text;
 
+        loop {
+            info!("Processing prompt: {}", truncate(&attempt_prompt, 100));
+
+            let outcome = self.run_prompt_attempt(&attempt_prompt, cancel_rx).await?;
+
+            match outcome {
+                ProcessEventsOutcome::Completed => return Ok(StopReason::EndTurn),
+                ProcessEventsOutcome::Cancelled => return Ok(StopReason::Cancelled),
+                ProcessEventsOutcome::Interrupted(message) => {
+                    // If cancel arrived between attempts, report cancellation instead of retrying.
+                    if cancel_rx.try_recv().is_ok() || self.cancelled.load(Ordering::SeqCst) {
+                        self.cancelled.store(true, Ordering::SeqCst);
+                        return Ok(StopReason::Cancelled);
+                    }
+
+                    if attempts < MAX_INTERRUPTED_RETRIES {
+                        attempts += 1;
+                        warn!(
+                            "{}; retrying once (attempt {}/{})",
+                            message, attempts, MAX_INTERRUPTED_RETRIES
+                        );
+                        self.send_agent_text(INTERRUPTED_RETRY_NOTICE).await;
+                        attempt_prompt = INTERRUPTED_RETRY_PROMPT.to_string();
+                        continue;
+                    }
+
+                    error!("{}", message);
+                    self.send_error(&message);
+                    return Err(Error::internal_error().data(message));
+                }
+            }
+        }
+    }
+
+    async fn run_prompt_attempt(
+        &mut self,
+        prompt_text: &str,
+        cancel_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<ProcessEventsOutcome, Error> {
         let resume_session_id = self.cursor_session_id.lock().unwrap().clone();
 
         if let Some(ref sid) = resume_session_id {
@@ -264,7 +319,7 @@ impl SessionWorker {
         }
 
         let process = CursorProcess::spawn(
-            &prompt_text,
+            prompt_text,
             Some(self.cwd.as_path()),
             self.model.as_deref(),
             self.mode.as_deref(),
@@ -280,23 +335,87 @@ impl SessionWorker {
         let CursorProcessParts { child, event_rx } = process.into_parts();
         self.active_child = Some(child);
 
-        let result = self.process_events(event_rx, cancel_rx).await;
+        match self.process_events(event_rx, cancel_rx).await {
+            Ok(outcome) => Ok(self.finalize_child_after_attempt(outcome).await),
+            Err(err) => {
+                // Ensure we never leak an in-flight child process on error paths.
+                self.terminate_active_child().await;
+                Err(err)
+            }
+        }
+    }
 
+    async fn finalize_child_after_attempt(
+        &mut self,
+        outcome: ProcessEventsOutcome,
+    ) -> ProcessEventsOutcome {
+        let Some(mut child) = self.active_child.take() else {
+            return outcome;
+        };
+
+        match outcome {
+            ProcessEventsOutcome::Cancelled => {
+                // Cancel paths should already terminate the child; this is a safety net.
+                drop(child.kill().await);
+                drop(child.wait().await);
+                ProcessEventsOutcome::Cancelled
+            }
+            ProcessEventsOutcome::Completed => {
+                match tokio::time::timeout(
+                    Duration::from_secs(CHILD_EXIT_GUARD_TIMEOUT_SECS),
+                    child.wait(),
+                )
+                .await
+                {
+                    Ok(Ok(status)) => {
+                        if !status.success() {
+                            warn!("Cursor process exited non-zero after final result: {status}");
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Failed to wait for Cursor process exit after completion: {e}");
+                    }
+                    Err(_) => {
+                        warn!("Cursor process still running after completion; terminating");
+                        drop(child.kill().await);
+                        drop(child.wait().await);
+                    }
+                }
+                ProcessEventsOutcome::Completed
+            }
+            ProcessEventsOutcome::Interrupted(detail) => {
+                let detail = match tokio::time::timeout(
+                    Duration::from_secs(CHILD_EXIT_GUARD_TIMEOUT_SECS),
+                    child.wait(),
+                )
+                .await
+                {
+                    Ok(Ok(status)) if status.success() => format!(
+                        "{detail}; process exited successfully without terminal result event"
+                    ),
+                    Ok(Ok(status)) => format!("{detail}; process exited with status {status}"),
+                    Ok(Err(e)) => format!("{detail}; failed waiting for process exit: {e}"),
+                    Err(_) => {
+                        warn!(
+                            "Cursor process still running after stream interruption; terminating"
+                        );
+                        drop(child.kill().await);
+                        drop(child.wait().await);
+                        format!(
+                            "{detail}; process did not exit after stream interruption and was terminated"
+                        )
+                    }
+                };
+                ProcessEventsOutcome::Interrupted(detail)
+            }
+        }
+    }
+
+    async fn terminate_active_child(&mut self) {
         if let Some(mut child) = self.active_child.take() {
             drop(child.kill().await);
             drop(child.wait().await);
         }
-
-        // Pick up any cancel signal that arrived after process_events finished.
-        if cancel_rx.try_recv().is_ok() {
-            self.cancelled.store(true, Ordering::SeqCst);
-        }
-
-        if self.cancelled.load(Ordering::SeqCst) {
-            return Ok(StopReason::Cancelled);
-        }
-
-        result
     }
 
     /// Handle the /login command
@@ -402,7 +521,7 @@ impl SessionWorker {
         &mut self,
         mut event_rx: mpsc::Receiver<StreamEvent>,
         cancel_rx: &mut mpsc::Receiver<()>,
-    ) -> Result<StopReason, Error> {
+    ) -> Result<ProcessEventsOutcome, Error> {
         loop {
             tokio::select! {
                 event = event_rx.recv() => {
@@ -520,12 +639,13 @@ impl SessionWorker {
                             error!("Cursor error: {}", error);
                             self.send_agent_text(&format!("\n\nError: {}", error)).await;
                         }
-                        return Ok(StopReason::EndTurn);
+                        return Ok(ProcessEventsOutcome::Completed);
                     }
                     debug!(
                         "Cursor completed: duration={}ms",
                         res.duration_ms.unwrap_or(0)
                     );
+                    return Ok(ProcessEventsOutcome::Completed);
                 }
                 StreamEvent::User(_) => {
                     // User messages are echoed back, ignore
@@ -540,16 +660,19 @@ impl SessionWorker {
                             drop(child.kill().await);
                             drop(child.wait().await);
                         }
-                        return Ok(StopReason::Cancelled);
+                        return Ok(ProcessEventsOutcome::Cancelled);
                     }
                 }
             }
         }
 
         if self.cancelled.load(Ordering::SeqCst) {
-            Ok(StopReason::Cancelled)
+            Ok(ProcessEventsOutcome::Cancelled)
         } else {
-            Ok(StopReason::EndTurn)
+            warn!("Cursor event stream closed before terminal result event");
+            Ok(ProcessEventsOutcome::Interrupted(
+                "Cursor event stream closed before terminal result event".to_string(),
+            ))
         }
     }
 
