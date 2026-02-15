@@ -194,10 +194,13 @@ impl CursorAgent {
 
     /// Build available slash commands
     fn build_available_commands(&self) -> Vec<AvailableCommand> {
-        vec![AvailableCommand::new(
-            "login",
-            "Authenticate with Cursor via browser login",
-        )]
+        vec![
+            AvailableCommand::new("login", "Authenticate with Cursor via browser login"),
+            AvailableCommand::new(
+                "logout",
+                "Log out from Cursor and require login for future prompts",
+            ),
+        ]
     }
 
     /// Send available commands update to the client
@@ -598,11 +601,15 @@ impl Agent for CursorAgent {
         let session = self.get_session(&request.session_id)?;
         let result = session.prompt(request).await;
 
-        // Save the Cursor CLI session ID (even on error)
+        // Save (or clear) the Cursor CLI session ID (even on error)
         if let Some(cursor_sid) = session.cursor_session_id() {
             self.session_storage
                 .borrow_mut()
                 .set_cursor_session_id(&session_id_str, cursor_sid);
+        } else {
+            self.session_storage
+                .borrow_mut()
+                .clear_cursor_session_id(&session_id_str);
         }
 
         Ok(PromptResponse::new(result?))

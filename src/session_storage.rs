@@ -160,6 +160,14 @@ impl SessionStorage {
         }
     }
 
+    /// Clear a session's Cursor CLI session ID
+    pub fn clear_cursor_session_id(&mut self, session_id: &str) {
+        if let Some(meta) = self.sessions.get_mut(session_id) {
+            meta.cursor_session_id = None;
+            self.save();
+        }
+    }
+
     /// Update the global model preference
     pub fn set_model(&mut self, model: String) {
         self.last_model = Some(model);

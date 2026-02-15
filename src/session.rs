@@ -268,6 +268,9 @@ impl SessionWorker {
         if trimmed == "/login" || trimmed == "login" {
             return self.handle_login_command().await;
         }
+        if trimmed == "/logout" || trimmed == "logout" {
+            return self.handle_logout_command().await;
+        }
 
         let mut attempts = 0usize;
         let mut attempt_prompt = prompt_text;
@@ -471,6 +474,70 @@ impl SessionWorker {
                     Err(e) => {
                         error!("Failed to spawn login process: {e}");
                         self.send_agent_text(&format!("Failed to launch login: {e}\n"))
+                            .await;
+                        Err(Error::internal_error().data(e.to_string()))
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Cursor CLI not found: {e}");
+                self.send_agent_text(
+                    "Cursor CLI not found. Please install it:\n\
+                    curl https://cursor.com/install -fsSL | bash\n",
+                )
+                .await;
+                Err(Error::internal_error().data(e.to_string()))
+            }
+        }
+    }
+
+    /// Handle the /logout command
+    async fn handle_logout_command(&mut self) -> Result<StopReason, Error> {
+        info!("Handling /logout command");
+
+        match find_cursor_binary() {
+            Ok(binary_path) => {
+                info!("Found cursor binary at: {:?}", binary_path);
+                self.send_agent_text("Logging out of Cursor...\n").await;
+
+                let result = tokio::process::Command::new(&binary_path)
+                    .arg("logout")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+
+                match result {
+                    Ok(mut child) => {
+                        info!("Logout process spawned successfully");
+                        match child.wait().await {
+                            Ok(status) => {
+                                info!("Logout process exited with status: {}", status);
+                                if status.success() {
+                                    *self.cursor_session_id.lock().unwrap() = None;
+                                    self.send_agent_text(
+                                        "Logout completed. You'll be prompted to login on your next request.\n",
+                                    )
+                                    .await;
+                                } else {
+                                    self.send_agent_text(&format!(
+                                        "Logout process exited with status: {}\n",
+                                        status
+                                    ))
+                                    .await;
+                                }
+                                Ok(StopReason::EndTurn)
+                            }
+                            Err(e) => {
+                                error!("Failed to wait for logout process: {e}");
+                                self.send_agent_text(&format!("Error waiting for logout: {e}\n"))
+                                    .await;
+                                Ok(StopReason::EndTurn)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to spawn logout process: {e}");
+                        self.send_agent_text(&format!("Failed to launch logout: {e}\n"))
                             .await;
                         Err(Error::internal_error().data(e.to_string()))
                     }
