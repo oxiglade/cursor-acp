@@ -76,12 +76,8 @@ pub fn parse_models_output(stdout: &str) -> Vec<(String, String)> {
             let dash = " - ";
             if let Some(pos) = trimmed.find(dash) {
                 let id = trimmed[..pos].trim().to_string();
-                let mut name = trimmed[pos + dash.len()..].to_string();
-                // Remove "(current)" or "(default)" suffix
-                if let Some(open) = name.find('(') {
-                    name = name[..open].trim().to_string();
-                }
-                let name = name.trim().to_string();
+                let raw_name = &trimmed[pos + dash.len()..];
+                let name = strip_model_status_suffixes(raw_name);
                 if !id.is_empty() && !name.is_empty() {
                     // Avoid duplicate "auto"
                     if id == "auto" && models.iter().any(|(i, _)| i == "auto") {
@@ -102,6 +98,31 @@ pub fn parse_models_output(stdout: &str) -> Vec<(String, String)> {
         models.insert(0, ("auto".to_string(), "Auto".to_string()));
     }
     models
+}
+
+fn strip_model_status_suffixes(name: &str) -> String {
+    let mut current = name.trim().to_string();
+
+    loop {
+        let trimmed = current.trim_end();
+        if !trimmed.ends_with(')') {
+            return trimmed.to_string();
+        }
+
+        let Some(open_idx) = trimmed.rfind('(') else {
+            return trimmed.to_string();
+        };
+
+        let suffix = trimmed[open_idx + 1..trimmed.len() - 1]
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(suffix.as_str(), "current" | "default") {
+            current = trimmed[..open_idx].trim_end().to_string();
+            continue;
+        }
+
+        return trimmed.to_string();
+    }
 }
 
 /// Load the list of models from the Cursor CLI. On failure returns an error; caller can fall back to a default list.
@@ -323,7 +344,7 @@ impl Drop for CursorProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_models_output;
+    use super::{parse_models_output, strip_model_status_suffixes};
 
     #[test]
     fn test_parse_models_output() {
@@ -355,6 +376,33 @@ opus-4.5 - Claude 4.5 Opus
         assert!(models
             .iter()
             .any(|(id, name)| id == "sonnet-4.5" && name == "Claude 4.5 Sonnet"));
+    }
+
+    #[test]
+    fn test_parse_models_output_preserves_thinking_suffix() {
+        let output = "Available models\n\n\
+                      opus-4.6-thinking - Claude 4.6 Opus (Thinking)  (default)\n\
+                      opus-4.6 - Claude 4.6 Opus\n";
+        let models = parse_models_output(output);
+
+        assert!(models.iter().any(|(id, name)| {
+            id == "opus-4.6-thinking" && name == "Claude 4.6 Opus (Thinking)"
+        }));
+        assert!(models
+            .iter()
+            .any(|(id, name)| id == "opus-4.6" && name == "Claude 4.6 Opus"));
+    }
+
+    #[test]
+    fn test_strip_model_status_suffixes_multiple_status_markers() {
+        assert_eq!(
+            strip_model_status_suffixes("Auto  (current)  (default)"),
+            "Auto"
+        );
+        assert_eq!(
+            strip_model_status_suffixes("Claude 4.6 Opus (Thinking)  (default)"),
+            "Claude 4.6 Opus (Thinking)"
+        );
     }
 
     #[test]
