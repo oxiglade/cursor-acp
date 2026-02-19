@@ -113,10 +113,12 @@ fn strip_model_status_suffixes(name: &str) -> String {
             return trimmed.to_string();
         };
 
-        let suffix = trimmed[open_idx + 1..trimmed.len() - 1]
-            .trim()
-            .to_ascii_lowercase();
-        if matches!(suffix.as_str(), "current" | "default") {
+        let inner = trimmed[open_idx + 1..trimmed.len() - 1].trim();
+        let is_status_only = !inner.is_empty()
+            && inner
+                .split(',')
+                .all(|part| matches!(part.trim().to_ascii_lowercase().as_str(), "current" | "default"));
+        if is_status_only {
             current = trimmed[..open_idx].trim_end().to_string();
             continue;
         }
@@ -402,6 +404,22 @@ opus-4.5 - Claude 4.5 Opus
         assert_eq!(
             strip_model_status_suffixes("Claude 4.6 Opus (Thinking)  (default)"),
             "Claude 4.6 Opus (Thinking)"
+        );
+    }
+
+    #[test]
+    fn test_strip_model_status_suffixes_combined_current_default() {
+        assert_eq!(
+            strip_model_status_suffixes("Auto (current, default)"),
+            "Auto"
+        );
+        assert_eq!(
+            strip_model_status_suffixes("Claude 4.6 Opus (Thinking) (current, default)"),
+            "Claude 4.6 Opus (Thinking)"
+        );
+        assert_eq!(
+            strip_model_status_suffixes("Auto (default, current)"),
+            "Auto"
         );
     }
 
